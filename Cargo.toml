@@ -1,0 +1,32 @@
+[package]
+name = "cognidns"
+version = "0.10.0"
+edition = "2021"
+default-run = "cognidns"
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+clap = { version = "4", features = ["derive"] }
+data-encoding = "2"
+futures = "0.3"
+hickory-proto = { version = "0.25.2", features = ["dnssec-ring"] }
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
+chrono = { version = "0.4", default-features = true, features = ["clock"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+urlencoding = "2"

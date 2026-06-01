@@ -1,0 +1,90 @@
+# CogniDNS 基础配置示例
+# 目标：最小可用、易于本地联调、尽量少引入复杂特性。
+
+udp_listen = "0.0.0.0:5300"
+tcp_listen = "0.0.0.0:5300"
+admin_listen = "127.0.0.1:8080"
+control_listen = "127.0.0.1:19090"
+control_token = "replace-with-a-random-token"
+
+resolve_mode = "forwarder"
+iterative_address_family = "ipv4"
+root_servers = ["198.41.0.4:53", "199.9.14.201:53", "192.33.4.12:53", "199.7.91.13:53"]
+iterative_max_depth = 8
+iterative_timeout_ms = 3000
+cname_chain_max_depth = 8
+follow_cname_chain = true
+ns_hostname_resolve_mode = "bootstrap_recursive"
+
+upstreams = ["223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"]
+upstream_timeout_ms = 1500
+upstream_retries = 1
+unhealthy_backoff_ms = 3000
+upstream_score_rtt_weight = 1.0
+upstream_score_failure_weight = 25.0
+upstream_score_success_weight = 3.0
+
+response_cache_capacity = 100000
+cache_hot_capacity = 20000
+cache_ttl_secs = 30
+prefetch_budget_per_window = 32
+prefetch_window_secs = 1
+prefetch_ttl_trigger_secs = 5
+prefetch_popularity_threshold = 3
+freeze_cache_ttl_decay = false
+freeze_cache_domains = []
+
+ns_host_cache_capacity = 2048
+ns_host_cache_ttl_secs = 60
+ns_host_cache_cleanup_interval_ms = 1000
+enable_delegation_cache = false
+strict_bailiwick = true
+delegation_cache_capacity = 2048
+delegation_cache_ttl_cap_secs = 300
+delegation_cache_cleanup_interval_ms = 1000
+delegation_failure_backoff_ms = 2000
+
+ns_hostname_max_concurrent = 4
+ns_hostname_enough_endpoints = 2
+ns_hostname_per_resolve_ms = 1500
+iterative_per_hop_timeout_ms = 0
+
+stats_window_secs = 60
+stats_short_window_secs = 10
+topn_stats_enabled = false
+adaptive_cache_enabled = true
+adaptive_cache_min_capacity = 50000
+adaptive_cache_max_capacity = 200000
+adaptive_cache_step = 10000
+adaptive_cache_window_secs = 10
+adaptive_cache_high_miss_ratio = 0.55
+adaptive_cache_low_miss_ratio = 0.15
+
+allow_clients = []
+blocked_domains = []
+blocked_domains_file = "config/default/blocked_domains.toml"
+rate_limit_per_second = 0
+deny_any_queries = false
+
+static_records_file = "config/default/static_records.toml"
+
+dot.enabled = false
+dot.listen = "0.0.0.0:853"
+dot.cert_file = "config/dot.crt"
+dot.key_file = "config/dot.key"
+
+doh.enabled = false
+doh.listen = "0.0.0.0:8053"
+
+dnssec.enabled = false
+dnssec.use_builtin_trust_anchors = true
+dnssec.trust_anchor_files = []
+
+logging.enabled = true
+logging.console = true
+logging.directory = "logs"
+logging.rotation = "day"
+logging.format = "compact"
+logging.query_level = "info"
+logging.response_level = "info"
+logging.general_level = "info"

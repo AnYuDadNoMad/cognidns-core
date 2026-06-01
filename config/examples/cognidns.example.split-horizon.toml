@@ -1,0 +1,79 @@
+# CogniDNS Split-Horizon（视图）示例
+# 目标：按客户端来源网段返回不同静态记录，并支持视图级黑名单。
+
+udp_listen = "0.0.0.0:5300"
+tcp_listen = "0.0.0.0:5300"
+admin_listen = "127.0.0.1:8080"
+control_listen = "127.0.0.1:19090"
+control_token = "replace-with-a-random-token"
+
+resolve_mode = "forwarder"
+upstreams = ["223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"]
+
+# 全局策略（无视图命中时生效）
+allow_clients = []
+blocked_domains = []
+blocked_domains_file = "config/default/blocked_domains.toml"
+rate_limit_per_second = 0
+deny_any_queries = false
+
+# 全局静态记录（视图未命中或视图无记录时回退）
+static_records = []
+static_records_file = "config/default/static_records.toml"
+
+# 视图 1：访客网段（按配置顺序首个命中）
+[[views]]
+name = "guest"
+client_cidrs = ["192.168.2.0/24"]
+blocked_domains = []
+blocked_domains_file = "config/guest/blocked_domains.toml"
+query_mode = "view_only"
+enable_recursion = false
+static_records = []
+static_records_file = "config/guest/static_records.toml"
+# 权威记录请通过 authoritative_zones/authoritative_zones_dir 配置（必须包含 SOA）
+# authoritative_zones_dir = "config/guest"
+
+# 视图 2：内网网段
+[[views]]
+name = "internal"
+client_cidrs = ["10.0.0.0/8", "172.16.0.0/12"]
+blocked_domains = []
+blocked_domains_file = "config/internal/blocked_domains.toml"
+query_mode = "global_fallback"
+enable_recursion = true
+static_records = []
+static_records_file = "config/internal/static_records.toml"
+
+# 可选：默认视图（名称必须为 default）。
+# 当请求客户端未命中任何视图的 client_cidrs 时，将自动回退到该视图。
+# [[views]]
+# name = "default"
+# client_cidrs = []
+# blocked_domains = []
+# blocked_domains_file = "config/default/blocked_domains.toml"
+# query_mode = "global_fallback"
+# enable_recursion = true
+# static_records = []
+# static_records_file = "config/default/static_records.toml"
+
+# 历史兼容字段 `records` 仍可解析，但不再推荐新增使用：
+# records = [
+#   { domain_name = "legacy.example.com", ip = "10.20.30.41" }
+# ]
+
+# 协议扩展开关按需启用
+[dot]
+enabled = false
+listen = "0.0.0.0:853"
+cert_file = "config/dot.crt"
+key_file = "config/dot.key"
+
+[doh]
+enabled = false
+listen = "0.0.0.0:8053"
+
+[dnssec]
+enabled = false
+use_builtin_trust_anchors = true
+trust_anchor_files = []

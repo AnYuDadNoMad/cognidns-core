@@ -1,0 +1,17 @@
+name = "1.cn"
+default_ttl = 300
+
+[soa]
+mname = "ns1.1.cn"
+rname = "hostmaster.1.cn"
+serial = 2026052501
+refresh = 3600
+retry = 600
+expire = 86400
+minimum_ttl = 300
+
+[[records]]
+qname = "www.1.cn"
+qtype = "A"
+answer = "1.1.1.1"
+ttl = 300

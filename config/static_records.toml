@@ -1,0 +1,39 @@
+# External static DNS records file.
+# Keep large static record sets (10k+) here to avoid an oversized main config.
+# Supported field aliases:
+# - name or qname
+# - rtype or qtype
+# - value or answer
+# - ttl (optional, default 300)
+#
+# Two equivalent styles for declaring records:
+#
+# Style 1 — array-of-tables (one record per block, preferred for readability):
+#   [[static_records]]
+#   name  = "www.example.com"
+#   rtype = "A"
+#   value = "1.2.3.4"
+#   ttl   = 300
+#
+# Style 2 — inline array (compact, suitable for embedding in the main config):
+#   static_records = [
+#     { name = "www.example.com", rtype = "A", value = "1.2.3.4", ttl = 300 },
+#   ]
+
+[[static_records]]
+name = "www.wanbo.cn"
+rtype = "A"
+value = "5.5.5.5"
+ttl = 600
+
+[[static_records]]
+name = "www.wan.cn"
+rtype = "AAAA"
+value = "1::1"
+ttl = 600
+
+[[static_records]]
+name = "www.bobo.com"
+rtype = "CNAME"
+value = "www.baidu.com"
+ttl = 120

@@ -1,0 +1,12 @@
+# CogniDNS-Ctl configuration
+# Control TCP endpoint of the running CogniDNS agent.
+server = "127.0.0.1:19090"
+
+# Optional control token.
+# token = "changeme"
+
+# Request timeout in milliseconds.
+timeout_ms = 5000
+
+# Output style: json | table (table is used by top commands).
+output = "json"

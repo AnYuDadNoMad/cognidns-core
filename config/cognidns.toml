@@ -1,0 +1,124 @@
+adaptive_cache_enabled = true
+adaptive_cache_high_miss_ratio = 0.5
+adaptive_cache_low_miss_ratio = 0.12
+adaptive_cache_max_capacity = 600000
+adaptive_cache_min_capacity = 100000
+adaptive_cache_step = 20000
+adaptive_cache_window_secs = 10
+admin_listen = "0.0.0.0:8080"
+allow_clients = []
+authoritative_sources = []
+blocked_domains = []
+blocked_domains_file = "config/default/blocked_domains.toml"
+cache_hot_capacity = 100000
+cache_ttl_secs = 30
+cname_chain_max_depth = 8
+control_listen = "127.0.0.1:19090"
+control_token = "changeme"
+delegation_cache_capacity = 8192
+delegation_cache_cleanup_interval_ms = 1000
+delegation_cache_ttl_cap_secs = 900
+delegation_failure_backoff_ms = 1200
+deny_any_queries = true
+enable_delegation_cache = true
+enable_recursion = true
+follow_cname_chain = true
+freeze_cache_domains = []
+freeze_cache_ttl_decay = false
+iterative_address_family = "ipv4"
+iterative_cname_bridge_fallback_to_recursive = true
+iterative_fallback_to_forwarder = false
+iterative_max_depth = 12
+iterative_per_hop_timeout_ms = 0
+iterative_timeout_ms = 10000
+minimal_response = false
+ns_host_cache_capacity = 30000
+ns_host_cache_cleanup_interval_ms = 1000
+ns_host_cache_ttl_secs = 180
+ns_hostname_enough_endpoints = 2
+ns_hostname_max_concurrent = 8
+ns_hostname_per_resolve_ms = 2500
+ns_hostname_resolve_mode = "pure_iterative"
+prefetch_budget_per_window = 256
+prefetch_popularity_threshold = 2
+prefetch_ttl_trigger_secs = 8
+prefetch_window_secs = 1
+prewarm_delegation_zones = []
+rate_limit_per_second = 0
+resolve_mode = "iterative"
+response_cache_capacity = 300000
+root_servers = [
+    "198.41.0.4:53",
+    "199.9.14.201:53",
+    "192.33.4.12:53",
+    "199.7.91.13:53",
+]
+static_cname_expand_for_address_queries = true
+static_records = []
+static_records_file = "config/default/static_records.toml"
+stats_short_window_secs = 10
+stats_window_secs = 60
+strict_bailiwick = false
+tcp_listen = "0.0.0.0:5300"
+topn_stats_enabled = true
+udp_listen = "0.0.0.0:5300"
+unhealthy_backoff_ms = 1500
+upstream_retries = 1
+upstream_score_failure_weight = 25.0
+upstream_score_rtt_weight = 1.2
+upstream_score_success_weight = 4.0
+upstream_timeout_ms = 1200
+upstreams = []
+
+[dnssec]
+enabled = true
+trust_anchor_files = []
+use_builtin_trust_anchors = true
+
+[doh]
+enabled = false
+listen = "0.0.0.0:8053"
+
+[dot]
+cert_file = "config/dot.crt"
+enabled = false
+key_file = "config/dot.key"
+listen = "0.0.0.0:853"
+
+[health_check]
+all_unhealthy_log_file = "logs/health-all-unhealthy.log"
+enabled = false
+failure_threshold = 3
+http_path = "/healthz"
+interval_secs = 20
+max_parallel = 32
+mode = "https"
+notify_webhook_backoff_ms = 300
+notify_webhook_retries = 3
+port = 443
+probe_tls_insecure_skip_verify = false
+success_threshold = 2
+timeout_ms = 1500
+webhook_tls_insecure_skip_verify = false
+
+[logging]
+console = true
+directory = "logs"
+enabled = true
+format = "compact"
+general_level = "trace"
+query_level = "trace"
+response_level = "info"
+rotation = "day"
+trace_query_domains = []
+
+[[views]]
+authoritative_zones_dir = "config/default"
+blocked_domains_file = "config/default/blocked_domains.toml"
+client_cidrs = []
+enable_recursion = true
+name = "default"
+query_mode = "global_fallback"
+static_records_file = "config/default/static_records.toml"
+view_authoritative_cname_expand_for_address_queries = true
+view_static_cname_expand_for_address_queries = true

@@ -1,0 +1,91 @@
+# CogniDNS 安全配置示例
+# 目标：优先开启访问控制、DNSSEC、本地控制面保护和可审计日志。
+# 使用前请按实际网段修改 allow_clients，并替换 control_token。
+
+udp_listen = "0.0.0.0:5300"
+tcp_listen = "0.0.0.0:5300"
+admin_listen = "127.0.0.1:8080"
+control_listen = "127.0.0.1:19090"
+control_token = "replace-with-a-long-random-token"
+
+resolve_mode = "iterative"
+iterative_address_family = "ipv4"
+root_servers = ["198.41.0.4:53", "199.9.14.201:53", "192.33.4.12:53", "199.7.91.13:53"]
+iterative_max_depth = 12
+iterative_timeout_ms = 6000
+cname_chain_max_depth = 8
+follow_cname_chain = true
+ns_hostname_resolve_mode = "bootstrap_recursive"
+
+upstreams = ["1.1.1.1:53", "9.9.9.9:53", "8.8.8.8:53"]
+upstream_timeout_ms = 1500
+upstream_retries = 1
+unhealthy_backoff_ms = 3000
+upstream_score_rtt_weight = 1.0
+upstream_score_failure_weight = 25.0
+upstream_score_success_weight = 3.0
+
+response_cache_capacity = 150000
+cache_hot_capacity = 30000
+cache_ttl_secs = 30
+prefetch_budget_per_window = 32
+prefetch_window_secs = 1
+prefetch_ttl_trigger_secs = 5
+prefetch_popularity_threshold = 3
+freeze_cache_ttl_decay = false
+freeze_cache_domains = []
+
+ns_host_cache_capacity = 4096
+ns_host_cache_ttl_secs = 60
+ns_host_cache_cleanup_interval_ms = 1000
+enable_delegation_cache = true
+strict_bailiwick = true
+delegation_cache_capacity = 4096
+delegation_cache_ttl_cap_secs = 300
+delegation_cache_cleanup_interval_ms = 1000
+delegation_failure_backoff_ms = 2000
+
+ns_hostname_max_concurrent = 3
+ns_hostname_enough_endpoints = 2
+ns_hostname_per_resolve_ms = 800
+iterative_per_hop_timeout_ms = 1200
+
+stats_window_secs = 60
+stats_short_window_secs = 10
+topn_stats_enabled = false
+adaptive_cache_enabled = true
+adaptive_cache_min_capacity = 100000
+adaptive_cache_max_capacity = 250000
+adaptive_cache_step = 10000
+adaptive_cache_window_secs = 10
+adaptive_cache_high_miss_ratio = 0.55
+adaptive_cache_low_miss_ratio = 0.15
+
+allow_clients = ["127.0.0.1/32", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+blocked_domains = []
+blocked_domains_file = "config/default/blocked_domains.toml"
+rate_limit_per_second = 200
+deny_any_queries = true
+
+static_records_file = "config/default/static_records.toml"
+
+dot.enabled = false
+dot.listen = "0.0.0.0:853"
+dot.cert_file = "config/dot.crt"
+dot.key_file = "config/dot.key"
+
+doh.enabled = false
+doh.listen = "127.0.0.1:8053"
+
+dnssec.enabled = true
+dnssec.use_builtin_trust_anchors = true
+dnssec.trust_anchor_files = []
+
+logging.enabled = true
+logging.console = false
+logging.directory = "logs"
+logging.rotation = "day"
+logging.format = "json"
+logging.query_level = "info"
+logging.response_level = "info"
+logging.general_level = "info"

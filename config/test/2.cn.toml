@@ -1,0 +1,17 @@
+name = "2.cn"
+default_ttl = 300
+
+[soa]
+mname = "ns1.2.cn"
+rname = "hostmaster.2.cn"
+serial = 2026052501
+refresh = 3600
+retry = 600
+expire = 86400
+minimum_ttl = 300
+
+[[records]]
+qname = "www.2.cn"
+qtype = "A"
+answer = "2.2.2.2"
+ttl = 300

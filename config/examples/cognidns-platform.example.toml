@@ -1,0 +1,42 @@
+listen = "127.0.0.1:9080"
+request_timeout_ms = 2000
+refresh_interval_secs = 10
+
+[storage]
+enabled = true
+sqlite_path = "data/platform.sqlite3"
+bootstrap_from_config = true
+
+[backup]
+enabled = false
+interval_secs = 3600
+retention_count = 30
+backup_dir = "backups/platform"
+replica_dir = ""
+replica_retry_count = 2
+
+# Optional: Enable platform-level authentication
+# Uncomment to enable and set a strong token
+# [auth]
+# admin_token = "your-secure-platform-token-here"
+
+[[instances]]
+id = "local-dev"
+name = "local-dev"
+admin_url = "http://127.0.0.1:8080"
+token = "changeme"
+# Optional: control endpoint for start/stop orchestration from platform
+control_listen = "127.0.0.1:19090"
+control_token = "changeme"
+environment = "dev"
+region = "local"
+tags = ["bootstrap", "single-node"]
+
+[[instances]]
+id = "staging-cn-01"
+name = "staging-cn-01"
+admin_url = "http://10.0.0.21:8080"
+token = "replace-with-real-token"
+environment = "staging"
+region = "cn-east"
+tags = ["staging", "edge"]

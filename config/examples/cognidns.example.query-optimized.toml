@@ -1,0 +1,117 @@
+# CogniDNS 查询优化配置示例
+# 目标：打开项目当前已实现的主要查询优化能力，偏吞吐与冷启动加速。
+# 注意：该配置优先考虑查询性能，默认关闭 DNSSEC 验证。
+
+udp_listen = "0.0.0.0:5300"
+tcp_listen = "0.0.0.0:5300"
+admin_listen = "127.0.0.1:8080"
+control_listen = "127.0.0.1:19090"
+control_token = "replace-with-a-random-token"
+
+resolve_mode = "iterative"
+iterative_address_family = "ipv4"
+root_servers = ["198.41.0.4:53", "199.9.14.201:53", "192.33.4.12:53", "199.7.91.13:53"]
+iterative_max_depth = 12
+iterative_timeout_ms = 8000
+cname_chain_max_depth = 8
+follow_cname_chain = true
+ns_hostname_resolve_mode = "bootstrap_recursive"
+
+upstreams = ["1.1.1.1:53", "8.8.8.8:53", "223.5.5.5:53"]
+upstream_timeout_ms = 1800
+upstream_retries = 2
+unhealthy_backoff_ms = 3000
+upstream_score_rtt_weight = 1.2
+upstream_score_failure_weight = 25.0
+upstream_score_success_weight = 3.0
+
+response_cache_capacity = 300000
+cache_hot_capacity = 80000
+cache_ttl_secs = 30
+prefetch_budget_per_window = 256
+prefetch_window_secs = 1
+prefetch_ttl_trigger_secs = 8
+prefetch_popularity_threshold = 2
+freeze_cache_ttl_decay = false
+freeze_cache_domains = []
+
+ns_host_cache_capacity = 20000
+ns_host_cache_ttl_secs = 120
+ns_host_cache_cleanup_interval_ms = 1000
+enable_delegation_cache = true
+strict_bailiwick = true
+delegation_cache_capacity = 8192
+delegation_cache_ttl_cap_secs = 900
+delegation_cache_cleanup_interval_ms = 1000
+delegation_failure_backoff_ms = 1500
+
+ns_hostname_max_concurrent = 8
+ns_hostname_enough_endpoints = 4
+ns_hostname_per_resolve_ms = 900
+iterative_per_hop_timeout_ms = 0
+
+[[prewarm_delegation_zones]]
+zone = "com."
+ttl_secs = 900
+ns_endpoints = [
+  "192.5.6.30:53",
+  "192.33.14.30:53",
+  "192.26.92.30:53",
+  "192.31.80.30:53",
+]
+
+[[prewarm_delegation_zones]]
+zone = "net."
+ttl_secs = 900
+ns_endpoints = [
+  "192.5.6.30:53",
+  "192.33.14.30:53",
+]
+
+[[prewarm_delegation_zones]]
+zone = "cn."
+ttl_secs = 900
+ns_endpoints = [
+  "203.119.25.1:53",
+  "203.119.26.1:53",
+]
+
+stats_window_secs = 60
+stats_short_window_secs = 10
+topn_stats_enabled = false
+adaptive_cache_enabled = true
+adaptive_cache_min_capacity = 100000
+adaptive_cache_max_capacity = 500000
+adaptive_cache_step = 20000
+adaptive_cache_window_secs = 10
+adaptive_cache_high_miss_ratio = 0.50
+adaptive_cache_low_miss_ratio = 0.12
+
+allow_clients = []
+blocked_domains = []
+blocked_domains_file = "config/default/blocked_domains.toml"
+rate_limit_per_second = 0
+deny_any_queries = true
+
+static_records_file = "config/default/static_records.toml"
+
+dot.enabled = false
+dot.listen = "0.0.0.0:853"
+dot.cert_file = "config/dot.crt"
+dot.key_file = "config/dot.key"
+
+doh.enabled = false
+doh.listen = "0.0.0.0:8053"
+
+dnssec.enabled = false
+dnssec.use_builtin_trust_anchors = true
+dnssec.trust_anchor_files = []
+
+logging.enabled = true
+logging.console = false
+logging.directory = "logs"
+logging.rotation = "day"
+logging.format = "compact"
+logging.query_level = "warn"
+logging.response_level = "warn"
+logging.general_level = "info"

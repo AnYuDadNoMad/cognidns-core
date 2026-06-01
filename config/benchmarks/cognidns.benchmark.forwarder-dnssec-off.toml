@@ -1,0 +1,59 @@
+﻿udp_listen = "127.0.0.1:5305"
+tcp_listen = "127.0.0.1:5305"
+admin_listen = "127.0.0.1:8085"
+control_listen = "127.0.0.1:19095"
+
+resolve_mode = "forwarder"
+root_servers = []
+iterative_max_depth = 8
+iterative_timeout_ms = 3000
+cname_chain_max_depth = 8
+follow_cname_chain = true
+upstreams = ["127.0.0.1:5534"]
+upstream_timeout_ms = 500
+upstream_retries = 0
+unhealthy_backoff_ms = 200
+
+response_cache_capacity = 1
+cache_ttl_secs = 30
+freeze_cache_ttl_decay = false
+freeze_cache_domains = []
+ns_host_cache_capacity = 1
+ns_host_cache_ttl_secs = 60
+ns_host_cache_cleanup_interval_ms = 1000
+stats_window_secs = 60
+
+cache_hot_capacity = 1024
+prefetch_budget_per_window = 16
+prefetch_window_secs = 1
+prefetch_ttl_trigger_secs = 5
+prefetch_popularity_threshold = 2
+upstream_score_rtt_weight = 1.0
+upstream_score_failure_weight = 25.0
+upstream_score_success_weight = 3.0
+adaptive_cache_enabled = true
+adaptive_cache_min_capacity = 128
+adaptive_cache_max_capacity = 4096
+adaptive_cache_step = 128
+adaptive_cache_window_secs = 5
+adaptive_cache_high_miss_ratio = 0.6
+adaptive_cache_low_miss_ratio = 0.2
+allow_clients = []
+blocked_domains = []
+rate_limit_per_second = 0
+deny_any_queries = false
+
+[dnssec]
+enabled = false
+use_builtin_trust_anchors = false
+trust_anchor_files = []
+
+[logging]
+enabled = true
+console = false
+directory = "logs"
+rotation = "day"
+format = "compact"
+query_level = "off"
+response_level = "off"
+general_level = "error"

@@ -1,0 +1,143 @@
+# CogniDNS 推荐默认配置（易用性优化版）
+# 目标：
+# 1) 默认更安全（管理面仅本机、日志不过度、限制 ANY）
+# 2) 默认可用（开箱可跑，不依赖额外证书）
+# 3) 默认有性能（iterative + delegation cache + prewarm + 自适应缓存）
+# 4) 注意：若用本文件启动 agent，ctl 也必须带 --config config/examples/cognidns.example.recommended.toml
+#    或显式传入相同的 --token，否则会返回 unauthorized。
+
+# =================== 基础监听与控制配置 ===================
+# 默认使用 5300，避免与系统 DNS/其他服务的 53 端口冲突。
+# 验证查询时请显式指定 5300（如 nslookup 中执行 set port=5300）。
+udp_listen = "0.0.0.0:5300"
+tcp_listen = "0.0.0.0:5300"
+admin_listen = "127.0.0.1:8080"
+control_listen = "127.0.0.1:19090"
+# 必改：请替换为随机长 token
+control_token = "CHANGE_ME_TO_A_RANDOM_TOKEN"
+
+# =================== 解析模式与上游配置 ===================
+resolve_mode = "iterative"
+minimal_response = true
+iterative_address_family = "ipv4"
+root_servers = ["198.41.0.4:53", "199.9.14.201:53", "192.33.4.12:53", "199.7.91.13:53"]
+
+iterative_max_depth = 12
+iterative_timeout_ms = 8000
+cname_chain_max_depth = 8
+follow_cname_chain = true
+iterative_cname_bridge_fallback_to_recursive = true
+ns_hostname_resolve_mode = "bootstrap_recursive"
+
+# iterative 模式下仍建议保留 upstreams 作为兜底
+upstreams = ["223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"]
+upstream_timeout_ms = 1800
+upstream_retries = 1
+unhealthy_backoff_ms = 3000
+upstream_score_rtt_weight = 1.0
+upstream_score_failure_weight = 25.0
+upstream_score_success_weight = 3.0
+
+# =================== 缓存与统计 ===================
+response_cache_capacity = 220000
+cache_hot_capacity = 55000
+cache_ttl_secs = 30
+
+prefetch_budget_per_window = 64
+prefetch_window_secs = 1
+prefetch_ttl_trigger_secs = 5
+prefetch_popularity_threshold = 3
+
+freeze_cache_ttl_decay = false
+freeze_cache_domains = []
+
+ns_host_cache_capacity = 10000
+ns_host_cache_ttl_secs = 60
+ns_host_cache_cleanup_interval_ms = 1000
+
+enable_delegation_cache = true
+strict_bailiwick = true
+delegation_cache_capacity = 4096
+delegation_cache_ttl_cap_secs = 600
+delegation_cache_cleanup_interval_ms = 1000
+delegation_failure_backoff_ms = 2000
+
+# =================== NS 主机名解析调优 ===================
+ns_hostname_max_concurrent = 4
+ns_hostname_enough_endpoints = 2
+ns_hostname_per_resolve_ms = 800
+iterative_per_hop_timeout_ms = 1200
+
+# =================== 委托区预热（冷启动加速） ===================
+[[prewarm_delegation_zones]]
+zone = "com."
+ttl_secs = 600
+ns_endpoints = [
+  "192.5.6.30:53",
+  "192.33.14.30:53",
+  "192.26.92.30:53",
+  "192.31.80.30:53",
+]
+
+[[prewarm_delegation_zones]]
+zone = "net."
+ttl_secs = 600
+ns_endpoints = [
+  "192.5.6.30:53",
+  "192.33.14.30:53",
+]
+
+[[prewarm_delegation_zones]]
+zone = "cn."
+ttl_secs = 600
+ns_endpoints = [
+  "203.119.25.1:53",
+  "203.119.26.1:53",
+]
+
+stats_window_secs = 60
+stats_short_window_secs = 10
+topn_stats_enabled = false
+
+adaptive_cache_enabled = true
+adaptive_cache_min_capacity = 100000
+adaptive_cache_max_capacity = 300000
+adaptive_cache_step = 10000
+adaptive_cache_window_secs = 10
+adaptive_cache_high_miss_ratio = 0.55
+adaptive_cache_low_miss_ratio = 0.15
+
+# =================== 策略与安全 ===================
+# 空列表表示允许所有客户端；生产建议按网段收敛
+allow_clients = []
+blocked_domains = []
+blocked_domains_file = "config/default/blocked_domains.toml"
+rate_limit_per_second = 1000
+deny_any_queries = true
+
+# =================== 静态记录 ===================
+static_records_file = "config/default/static_records.toml"
+
+# =================== DoT / DoH ===================
+dot.enabled = false
+dot.listen = "0.0.0.0:853"
+dot.cert_file = "config/dot.crt"
+dot.key_file = "config/dot.key"
+
+doh.enabled = false
+doh.listen = "127.0.0.1:8053"
+
+# =================== DNSSEC ===================
+dnssec.enabled = true
+dnssec.use_builtin_trust_anchors = true
+dnssec.trust_anchor_files = []
+
+# =================== 日志 ===================
+logging.enabled = true
+logging.console = true
+logging.directory = "logs"
+logging.rotation = "day"
+logging.format = "compact"
+logging.query_level = "info"
+logging.response_level = "info"
+logging.general_level = "info"

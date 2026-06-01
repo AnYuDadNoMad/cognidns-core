@@ -1,0 +1,26 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Core: Build Release",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--release"],
+      "group": "build"
+    },
+    {
+      "label": "Core: Run Agent",
+      "type": "shell",
+      "command": ".\\target\\release\\cognidns.exe",
+      "args": ["-vv", "agent", "--config", "config/cognidns.toml", "-d"],
+      "dependsOn": ["Core: Build Release"],
+      "dependsOrder": "sequence"
+    },
+    {
+      "label": "Core: Health Check",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/health-core.ps1"]
+    }
+  ]
+}

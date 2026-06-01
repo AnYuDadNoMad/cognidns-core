@@ -1,0 +1,289 @@
+# CogniDNS 全量配置示例（含注释与多种配置方式）
+# 说明：
+# 1) 本文件覆盖当前可配置的全部字段（AppConfig + 子配置块）。
+# 2) 每个字段都给出用途说明；部分字段给出“不同配置方法”。
+# 3) 你可以直接复制为 config/cognidns.toml，再按环境调整。
+
+# ==============================
+# 基础监听与控制面
+# ==============================
+udp_listen = "0.0.0.0:5300"         # DNS/UDP 监听地址
+tcp_listen = "0.0.0.0:5300"         # DNS/TCP 监听地址
+admin_listen = "127.0.0.1:8080"     # Admin HTTP 监听地址（建议仅本机）
+control_listen = "127.0.0.1:19090"  # 控制面监听地址
+control_token = "CHANGE_ME"          # 控制面令牌（强烈建议生产启用）
+
+# ==============================
+# 解析模式与迭代核心
+# ==============================
+resolve_mode = "iterative"           # 可选: forwarder | iterative
+enable_recursion = true              # 全局递归开关：false 时作为独立权威/静态应答服务器（区外返回 REFUSED）
+minimal_response = true              # 最小应答开关：true=默认不附加 MX/NS 目标 A/AAAA；false=本地可得时追加 Additional
+
+# 根服务器（iterative 模式会使用）
+root_servers = [
+  "198.41.0.4:53",
+  "199.9.14.201:53",
+  "192.33.4.12:53",
+  "199.7.91.13:53"
+]
+
+iterative_address_family = "dual_stack"  # 可选: dual_stack | ipv4 | ipv6
+iterative_max_depth = 12                  # 迭代最大深度
+iterative_timeout_ms = 8000               # 单次迭代总超时（毫秒）
+cname_chain_max_depth = 8                 # CNAME 链最大深度
+follow_cname_chain = true                 # 是否跟随 CNAME
+static_cname_expand_for_address_queries = true  # A/AAAA 命中静态 CNAME 时是否展开
+iterative_fallback_to_forwarder = false         # iterative 失败时是否回退 forwarder
+iterative_cname_bridge_fallback_to_recursive = true # CNAME 桥接补全
+
+# NS 主机缓存与委托缓存
+ns_host_cache_capacity = 10000
+ns_host_cache_ttl_secs = 180
+ns_host_cache_cleanup_interval_ms = 1000
+
+enable_delegation_cache = true
+strict_bailiwick = true
+delegation_cache_capacity = 8192
+delegation_cache_ttl_cap_secs = 900
+delegation_cache_cleanup_interval_ms = 1000
+delegation_failure_backoff_ms = 1200
+
+# 迭代/NS 主机名调优
+ns_hostname_max_concurrent = 8
+ns_hostname_enough_endpoints = 2
+ns_hostname_per_resolve_ms = 2000
+ns_hostname_resolve_mode = "bootstrap_recursive"  # 可选: bootstrap_recursive | pure_iterative
+iterative_per_hop_timeout_ms = 0  # 0 表示不限制；非 0 时应小于 iterative_timeout_ms
+
+# ==============================
+# 上游（forwarder 及桥接场景）
+# ==============================
+upstreams = [
+  "1.1.1.1:53",
+  "8.8.8.8:53",
+  "223.5.5.5:53"
+]
+upstream_timeout_ms = 1500
+upstream_retries = 1
+unhealthy_backoff_ms = 3000
+
+# 上游评分权重
+upstream_score_rtt_weight = 1.0
+upstream_score_failure_weight = 25.0
+upstream_score_success_weight = 3.0
+
+# ==============================
+# 缓存与预取
+# ==============================
+cache_hot_capacity = 50000
+response_cache_capacity = 200000
+cache_ttl_secs = 30
+
+prefetch_budget_per_window = 64
+prefetch_window_secs = 1
+prefetch_ttl_trigger_secs = 5
+prefetch_popularity_threshold = 3
+
+# TTL 冻结功能（仅调试/应急场景）
+freeze_cache_ttl_decay = false
+freeze_cache_domains = [
+  # "critical.example.com",
+  # "api.example.net"
+]
+
+# 自适应缓存
+adaptive_cache_enabled = true
+adaptive_cache_min_capacity = 100000
+adaptive_cache_max_capacity = 400000
+adaptive_cache_step = 10000
+adaptive_cache_window_secs = 10
+adaptive_cache_high_miss_ratio = 0.55
+adaptive_cache_low_miss_ratio = 0.15
+
+# 指标窗口与 TOPN
+stats_window_secs = 60
+stats_short_window_secs = 10
+topn_stats_enabled = true
+
+# ==============================
+# ACL / 黑名单 / 限流
+# ==============================
+allow_clients = [
+  # 留空表示允许所有客户端
+  # "127.0.0.1/32",
+  # "192.168.0.0/16"
+]
+
+blocked_domains = []
+# 示例条目请维护在 config/default/blocked_domains.toml 的 blocked_domains 数组。
+blocked_domains_file = "config/default/blocked_domains.toml"
+
+rate_limit_per_second = 0  # 0 = 关闭限流
+deny_any_queries = true
+
+# ==============================
+# 静态记录（两种方式）
+# ==============================
+# 方式 A：文件引用（推荐）
+static_records_file = "config/default/static_records.toml"
+
+# 方式 B：内联记录（可与文件方式二选一；若同时配置，文件加载后会覆盖 static_records）
+# [[static_records]]
+# qname = "www.inline-a.example.com"
+# qtype = "A"
+# answer = "203.0.113.10"
+# ttl = 300
+#
+# [[static_records]]
+# qname = "www.inline-aaaa.example.com"
+# qtype = "AAAA"
+# answer = "2001:db8::10"
+# ttl = 300
+#
+# [[static_records]]
+# qname = "www.inline-cname.example.com"
+# qtype = "CNAME"
+# answer = "target.example.com"
+# ttl = 120
+
+# ==============================
+# 视图（Split-Horizon）
+# ==============================
+# 说明：
+# - client_cidrs 命中按配置顺序优先。
+# - 未命中任何 client_cidrs 时，若存在 name="default" 的视图，将自动回退到该视图。
+
+[[views]]
+name = "default"
+summary = "默认出口视图；用于公网查询与本地权威区联合应答。"
+client_cidrs = []
+blocked_domains = []
+blocked_domains_file = "config/default/blocked_domains.toml"
+static_records_file = "config/default/static_records.toml"
+query_mode = "global_fallback"   # 可选: view_only | global_fallback
+enable_recursion = true
+authoritative_zones_file = "config/examples/authoritative_zones.example.toml"
+# authoritative_zones_dir = "config/examples/authoritative_zones.d/default"  # 一个区一个文件（文件名=区名）
+
+# 视图静态记录（新字段）
+# 视图静态记录、权威记录和兼容 records 可继续按需内联；
+# 当需要把默认视图数据完全外置时，优先使用 file 引用并保持主配置简洁。
+
+# 兼容字段 records（旧格式，仍可用）
+[[views.records]]
+domain_name = "legacy.default.example"
+ip = "10.10.10.30"
+
+[[views]]
+name = "corp"
+summary = "办公网络专用视图；仅返回企业内网定义数据。"
+client_cidrs = ["10.0.0.0/8", "172.16.0.0/12"]
+blocked_domains = []
+blocked_domains_file = "config/corp/blocked_domains.toml"
+query_mode = "view_only"
+enable_recursion = false
+static_records_file = "config/corp/static_records.toml"
+static_records = []
+records = []
+authoritative_zones = []
+# authoritative_zones_dir = "config/examples/authoritative_zones.d/corp"     # 可与 authoritative_zones_file 叠加
+
+# ==============================
+# 权威来源（authoritative_sources）
+# ==============================
+# source 可是 URL 或命令（由 fetch_authoritative_answer 处理）
+[[authoritative_sources]]
+qname = "dynamic-source.example.com"
+qtype = "TXT"
+source = "https://example.internal/dns/txt?name=dynamic-source.example.com"
+ttl = 60
+
+# ==============================
+# 权威区配置约束（当前版本）
+# ==============================
+# 仅允许在 views 内配置权威区：
+# - views[].authoritative_zones
+# - views[].authoritative_zones_file
+# - views[].authoritative_zones_dir
+#
+# 主配置顶层 authoritative_zones* 已禁用（validate 会报错）。
+
+# ==============================
+# 委托区预热（冷启动优化）
+# ==============================
+# 方式 A：直接给 NS 端点
+[[prewarm_delegation_zones]]
+zone = "com."
+ns_endpoints = ["192.5.6.30:53", "192.33.14.30:53"]
+ns_hostnames = []
+ttl_secs = 900
+
+# 方式 B：给 NS 主机名（启动后后台解析）
+[[prewarm_delegation_zones]]
+zone = "cn."
+ns_endpoints = []
+ns_hostnames = ["a.dns.cn.", "b.dns.cn."]
+ttl_secs = 900
+
+# ==============================
+# DoT / DoH
+# ==============================
+[dot]
+enabled = false
+listen = "0.0.0.0:853"
+cert_file = "config/dot.crt"
+key_file = "config/dot.key"
+
+[doh]
+enabled = false
+listen = "0.0.0.0:8053"
+
+# ==============================
+# DNSSEC
+# ==============================
+[dnssec]
+enabled = true
+use_builtin_trust_anchors = true
+trust_anchor_files = [
+  # "config/root.key"
+]
+
+# ==============================
+# 日志
+# ==============================
+[logging]
+enabled = true
+console = true
+directory = "logs"
+rotation = "day"                # 当前版本仅支持 day
+format = "compact"              # 可选: compact | json
+query_level = "info"            # 可选: trace/debug/info/warn/error
+response_level = "info"
+general_level = "info"
+trace_query_domains = [
+  # 仅对这些域输出更详细链路日志
+  "qq.com",
+  "example.com"
+]
+
+# ==============================
+# 健康检查（域名->IP探测）
+# ==============================
+[health_check]
+enabled = false
+mode = "tcp"                    # 可选: tcp | http | https
+port = 80
+http_path = "/"
+http_host_header = ""
+interval_secs = 30
+timeout_ms = 1000
+max_parallel = 64
+failure_threshold = 2
+success_threshold = 1
+all_unhealthy_log_file = "logs/health-all-unhealthy.log"
+notify_webhook = ""
+probe_tls_insecure_skip_verify = false
+webhook_tls_insecure_skip_verify = false
+notify_webhook_retries = 2
+notify_webhook_backoff_ms = 500

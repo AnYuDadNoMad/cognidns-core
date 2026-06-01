@@ -1,0 +1,7 @@
+# CogniDNS-Ctl example configuration
+# Use this file with: cargo run --bin cognidns_ctl -- --config config/examples/cognidns-ctl.example.toml health
+
+server = "127.0.0.1:19090"
+token = "replace-with-a-random-token"
+timeout_ms = 5000
+output = "json"
