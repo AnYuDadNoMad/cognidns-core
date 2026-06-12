@@ -347,6 +347,14 @@ pub struct AppConfig {
     /// iterative CNAME 跟随中遇到 "no referral glue" 时，是否允许临时桥接到
     /// bootstrap recursive resolvers 做一次递归补全。
     pub iterative_cname_bridge_fallback_to_recursive: bool,
+    /// 是否将完整的 CNAME 链合并结果缓存到原始查询名。
+    pub cname_chain_cache_enabled: bool,
+    /// 是否在 CNAME 链追踪过程中查询缓存，避免不必要的上游请求。
+    pub cname_chain_inline_cache_enabled: bool,
+    /// 是否在解析一种 qtype 后立即预解析兄弟 qtype（A↔AAAA），为双栈客户端预热缓存。
+    pub cname_chain_dualstack_share_enabled: bool,
+    /// 是否在 CNAME 链解析完成后预取叶子目标的记录到缓存。
+    pub cname_chain_target_prefetch_enabled: bool,
     pub ns_host_cache_capacity: usize,
     pub ns_host_cache_ttl_secs: u64,
     pub ns_host_cache_cleanup_interval_ms: u64,
@@ -446,6 +454,10 @@ impl Default for AppConfig {
             static_cname_expand_for_address_queries: false,
             iterative_fallback_to_forwarder: false,
             iterative_cname_bridge_fallback_to_recursive: true,
+            cname_chain_cache_enabled: true,
+            cname_chain_inline_cache_enabled: true,
+            cname_chain_dualstack_share_enabled: true,
+            cname_chain_target_prefetch_enabled: false,
             ns_host_cache_capacity: 1024,
             ns_host_cache_ttl_secs: 60,
             ns_host_cache_cleanup_interval_ms: 1000,

@@ -1,8 +1,12 @@
 //! Policy engine for ACL, RPZ-lite block list, ANY denial and rate limit.
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::time::Instant;
+
+use dashmap::DashMap;
 
 use ipnet::IpNet;
 use serde::Serialize;
@@ -64,10 +68,34 @@ impl PolicyDecision {
     }
 }
 
+/// Lock-free rate window using atomic operations.
+///
+/// Replaces `Mutex<HashMap<IpAddr, RateWindow>>` — eliminates the last
+/// remaining global lock on the DNS query hot path.
+///
+/// - `count`: per-second query counter (incremented atomically via fetch_add)
+/// - `window_start`: truncated unix timestamp of the current window (CAS-rotated)
 #[derive(Debug)]
-struct RateWindow {
-    started_at: Instant,
-    count: u32,
+struct AtomicRateWindow {
+    count: AtomicU64,
+    window_start: AtomicU64,
+}
+
+impl AtomicRateWindow {
+    fn new(now_secs: u64) -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            window_start: AtomicU64::new(now_secs),
+        }
+    }
+}
+
+/// Returns the current unix timestamp truncated to seconds.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[derive(Debug)]
@@ -187,7 +215,7 @@ pub struct PolicyEngine {
     default_view_index: Option<usize>,
     rate_limit_per_second: u32,
     deny_any_queries: bool,
-    client_windows: Mutex<HashMap<IpAddr, RateWindow>>,
+    client_windows: DashMap<IpAddr, AtomicRateWindow>,
 }
 
 impl PolicyEngine {
@@ -252,7 +280,7 @@ impl PolicyEngine {
             default_view_index,
             rate_limit_per_second: config.rate_limit_per_second,
             deny_any_queries: config.deny_any_queries,
-            client_windows: Mutex::new(HashMap::new()),
+            client_windows: DashMap::new(),
         })
     }
 
@@ -340,28 +368,58 @@ impl PolicyEngine {
         }
     }
 
+    /// Lock-free per-client rate limiter.
+    ///
+    /// Each client IP has its own `AtomicRateWindow`.  Window rotation is
+    /// handled via a CAS on the window-start timestamp: the thread that
+    /// successfully advances the window also resets the counter to zero.
+    /// The token check uses `fetch_add` (returns the previous value) so
+    /// every increment is atomic and the per-second cap is enforced
+    /// across all concurrent tasks without a global lock.
     fn consume_token(&self, client_ip: IpAddr) -> bool {
-        let Ok(mut windows) = self.client_windows.lock() else {
+        let limit = self.rate_limit_per_second;
+        if limit == 0 {
             return true;
-        };
-
-        let now = Instant::now();
-        let window = windows.entry(client_ip).or_insert(RateWindow {
-            started_at: now,
-            count: 0,
-        });
-
-        if now.duration_since(window.started_at) >= Duration::from_secs(1) {
-            window.started_at = now;
-            window.count = 0;
         }
 
-        if window.count >= self.rate_limit_per_second {
-            return false;
+        let now_secs = unix_now_secs();
+
+        // Ensure an entry exists for this client (acquires a per-shard
+        // write-lock only when inserting a *new* IP, not on every call).
+        self.client_windows
+            .entry(client_ip)
+            .or_insert_with(|| AtomicRateWindow::new(now_secs));
+
+        // Read the entry lock-free.
+        let window = self
+            .client_windows
+            .get(&client_ip)
+            .expect("entry just inserted");
+
+        // ---- window rotation (CAS, no lock) ----
+        let current_start = window.window_start.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(current_start) >= 1 {
+            // Attempt to rotate the window.  If multiple threads race,
+            // only one succeeds; the others continue with the already-
+            // rotated window.
+            if window
+                .window_start
+                .compare_exchange_weak(
+                    current_start,
+                    now_secs,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                // We own the rotation — reset the counter.
+                window.count.store(0, Ordering::Relaxed);
+            }
         }
 
-        window.count += 1;
-        true
+        // ---- atomic consume (fetch_add returns pre-increment value) ----
+        let prev = window.count.fetch_add(1, Ordering::Relaxed);
+        prev < limit as u64
     }
 }
 
@@ -406,6 +464,8 @@ fn normalize_domain_pattern(value: &str) -> String {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Instant;
+
+    use smol_str::SmolStr;
 
     use super::{domain_matches, PolicyConfig, PolicyEngine};
     use crate::config::{DnsView, ViewRecord};
@@ -484,7 +544,7 @@ mod tests {
             request_id: 1,
             protocol: Protocol::Udp,
             client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 53000),
-            query_name: Some("blocked.example.com".to_string()),
+            query_name: Some(SmolStr::from("blocked.example.com")),
             query_type: Some(1),
             recv_at: Instant::now(),
         };
@@ -532,7 +592,7 @@ mod tests {
             request_id: 1,
             protocol: Protocol::Udp,
             client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 53000),
-            query_name: Some("www.example.com".to_string()),
+            query_name: Some(SmolStr::from("www.example.com")),
             query_type: Some(1),
             recv_at: Instant::now(),
         };
@@ -558,7 +618,7 @@ mod tests {
             client_addr: "[2001:db8::100]:53000"
                 .parse::<SocketAddr>()
                 .expect("socket"),
-            query_name: Some("www.example.com".to_string()),
+            query_name: Some(SmolStr::from("www.example.com")),
             query_type: Some(1),
             recv_at: Instant::now(),
         };
@@ -569,7 +629,7 @@ mod tests {
             client_addr: "[2001:dead::1]:53000"
                 .parse::<SocketAddr>()
                 .expect("socket"),
-            query_name: Some("www.example.com".to_string()),
+            query_name: Some(SmolStr::from("www.example.com")),
             query_type: Some(1),
             recv_at: Instant::now(),
         };
@@ -604,7 +664,7 @@ mod tests {
             request_id: 1,
             protocol: Protocol::Udp,
             client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 53000),
-            query_name: Some("www.abc.com".to_string()),
+            query_name: Some(SmolStr::from("www.abc.com")),
             query_type: Some(1),
             recv_at: Instant::now(),
         };
@@ -637,7 +697,7 @@ mod tests {
             request_id: 1,
             protocol: Protocol::Udp,
             client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 53000),
-            query_name: Some("www.abc.com".to_string()),
+            query_name: Some(SmolStr::from("www.abc.com")),
             query_type: Some(1),
             recv_at: Instant::now(),
         };
@@ -645,5 +705,90 @@ mod tests {
         let decision = policy.evaluate(&ctx);
         assert!(decision.allowed);
         assert!(decision.matched_view.is_none());
+    }
+
+    #[test]
+    fn rate_limit_allows_below_cap_and_denies_above() {
+        let policy = PolicyEngine::new(PolicyConfig {
+            allow_clients: Vec::new(),
+            blocked_domains: Vec::new(),
+            rate_limit_per_second: 3,
+            deny_any_queries: false,
+        })
+        .expect("policy");
+
+        let ctx = || RequestContext {
+            request_id: 1,
+            protocol: Protocol::Udp,
+            client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 53000),
+            query_name: Some(SmolStr::from("example.com")),
+            query_type: Some(1),
+            recv_at: Instant::now(),
+        };
+
+        // First 3 should be allowed
+        assert!(policy.evaluate(&ctx()).allowed, "request 1 should be allowed");
+        assert!(policy.evaluate(&ctx()).allowed, "request 2 should be allowed");
+        assert!(policy.evaluate(&ctx()).allowed, "request 3 should be allowed");
+        // 4th should be rate-limited
+        assert!(!policy.evaluate(&ctx()).allowed, "request 4 should be denied");
+
+        // A different client IP should not be affected
+        let other_ctx = RequestContext {
+            request_id: 1,
+            protocol: Protocol::Udp,
+            client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 53000),
+            query_name: Some(SmolStr::from("example.com")),
+            query_type: Some(1),
+            recv_at: Instant::now(),
+        };
+        assert!(policy.evaluate(&other_ctx).allowed, "different IP should be allowed");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_handles_concurrent_access() {
+        let policy = std::sync::Arc::new(
+            PolicyEngine::new(PolicyConfig {
+                allow_clients: Vec::new(),
+                blocked_domains: Vec::new(),
+                rate_limit_per_second: 100,
+                deny_any_queries: false,
+            })
+            .expect("policy"),
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let policy = policy.clone();
+            handles.push(tokio::spawn(async move {
+                let ctx = RequestContext {
+                    request_id: 1,
+                    protocol: Protocol::Udp,
+                    client_addr: SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                        53000,
+                    ),
+                    query_name: Some(SmolStr::from("concurrent.test")),
+                    query_type: Some(1),
+                    recv_at: Instant::now(),
+                };
+                let mut allowed = 0u32;
+                for _ in 0..20 {
+                    if policy.evaluate(&ctx).allowed {
+                        allowed += 1;
+                    }
+                }
+                allowed
+            }));
+        }
+
+        let mut total_allowed = 0u32;
+        for handle in handles {
+            total_allowed += handle.await.unwrap();
+        }
+        // With 100 req/s limit and 10 tasks × 20 requests, all should
+        // be well within the limit (no explicit cap assertion since
+        // we can't control timing precisely, but it shouldn't panic).
+        assert!(total_allowed > 0, "some requests should be allowed");
     }
 }

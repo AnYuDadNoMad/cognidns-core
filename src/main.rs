@@ -566,6 +566,10 @@ async fn run_worker(config_path: &str, launch_options: LaunchOptions) -> anyhow:
             iterative_fallback_to_forwarder: cfg.iterative_fallback_to_forwarder,
             iterative_cname_bridge_fallback_to_recursive: cfg
                 .iterative_cname_bridge_fallback_to_recursive,
+            cname_chain_cache_enabled: cfg.cname_chain_cache_enabled,
+            cname_chain_inline_cache_enabled: cfg.cname_chain_inline_cache_enabled,
+            cname_chain_dualstack_share_enabled: cfg.cname_chain_dualstack_share_enabled,
+            cname_chain_target_prefetch_enabled: cfg.cname_chain_target_prefetch_enabled,
             ns_host_cache_capacity: cfg.ns_host_cache_capacity,
             ns_host_cache_ttl_secs: cfg.ns_host_cache_ttl_secs,
             ns_host_cache_cleanup_interval_ms: cfg.ns_host_cache_cleanup_interval_ms,

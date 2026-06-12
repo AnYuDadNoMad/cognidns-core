@@ -1,3 +1,4 @@
+use smol_str::SmolStr;
 use cognidns::cache::ResponseCache;
 use cognidns::codec::dns;
 use cognidns::context::{Protocol, RequestContext};
@@ -138,7 +139,7 @@ async fn e2e_dnssec_nxdomain_path_basic() -> anyhow::Result<()> {
         request_id: 0xdead,
         protocol: Protocol::Udp,
         client_addr: "127.0.0.1:53000".parse().unwrap(),
-        query_name: Some("no.such.domain.example".to_string()),
+        query_name: Some(SmolStr::from("no.such.domain.example")),
         query_type: Some(1),
         recv_at: std::time::Instant::now(),
     };
@@ -308,7 +309,7 @@ async fn e2e_nsec3_nodata() -> anyhow::Result<()> {
         request_id: 0xabba,
         protocol: Protocol::Udp,
         client_addr: "127.0.0.1:53002".parse().unwrap(),
-        query_name: Some("noa.example.com".to_string()),
+        query_name: Some(SmolStr::from("noa.example.com")),
         query_type: Some(1),
         recv_at: std::time::Instant::now(),
     };
@@ -600,7 +601,7 @@ async fn e2e_nsec3_nxdomain() -> anyhow::Result<()> {
         request_id: 0xfeed,
         protocol: Protocol::Udp,
         client_addr: "127.0.0.1:53001".parse().unwrap(),
-        query_name: Some("missing.example.com".to_string()),
+        query_name: Some(SmolStr::from("missing.example.com")),
         query_type: Some(1),
         recv_at: std::time::Instant::now(),
     };

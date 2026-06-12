@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use dashmap::DashMap;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,14 +45,73 @@ pub struct MetricsSnapshot {
     pub ip_health_notify_fail_total: u64,
 }
 
+// DepthAccumulator replaced by lock-free AtomicDepthAccumulator (see Metrics impl below).
+
+/// Lock-free depth accumulator for per-outcome depth tracking.
+/// Uses AtomicU64 for count, AtomicU64 for sum (f64 bits), AtomicU64 for max (f64 bits).
 #[derive(Debug, Default)]
-struct DepthAccumulator {
-    count: u64,
-    sum: f64,
-    max: f64,
+struct AtomicDepthAccumulator {
+    count: AtomicU64,
+    /// f64 bits stored as u64. Updated via CAS loop.
+    sum_bits: AtomicU64,
+    /// f64 bits stored as u64. Updated via CAS loop.
+    max_bits: AtomicU64,
 }
 
-#[derive(Debug, Default)]
+impl AtomicDepthAccumulator {
+    fn observe(&self, depth: f64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        // Update sum via CAS loop on f64-bits.
+        loop {
+            let old_bits = self.sum_bits.load(Ordering::Relaxed);
+            let old_val = f64::from_bits(old_bits);
+            let new_val = old_val + depth;
+            match self.sum_bits.compare_exchange_weak(
+                old_bits,
+                new_val.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        // Update max via CAS loop.
+        loop {
+            let old_bits = self.max_bits.load(Ordering::Relaxed);
+            let old_val = f64::from_bits(old_bits);
+            if depth <= old_val {
+                break;
+            }
+            match self.max_bits.compare_exchange_weak(
+                old_bits,
+                depth.to_bits(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn snapshot(&self) -> DepthSnapshot {
+        let count = self.count.load(Ordering::Relaxed);
+        let sum = f64::from_bits(self.sum_bits.load(Ordering::Relaxed));
+        let max = f64::from_bits(self.max_bits.load(Ordering::Relaxed));
+        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+        DepthSnapshot { count, avg, max }
+    }
+}
+
+/// Increment a counter in a DashMap keyed by String, inserting AtomicU64(0) if absent.
+fn dashmap_counter_inc(map: &DashMap<String, AtomicU64>, key: &str) {
+    map.entry(key.to_string())
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+#[derive(Debug)]
 pub struct Metrics {
     request_total: AtomicU64,
     cache_hit_total: AtomicU64,
@@ -61,14 +121,42 @@ pub struct Metrics {
     healthy_upstreams: AtomicUsize,
     reload_success_total: AtomicU64,
     reload_failure_total: AtomicU64,
-    iterative_events: Mutex<HashMap<String, u64>>,
-    ns_host_cache_events: Mutex<HashMap<String, u64>>,
-    iterative_depth: Mutex<HashMap<String, DepthAccumulator>>,
+    /// Lock-free: per-event atomic counters, no Mutex on hot path.
+    iterative_events: DashMap<String, AtomicU64>,
+    /// Lock-free: per-action atomic counters, no Mutex on hot path.
+    ns_host_cache_events: DashMap<String, AtomicU64>,
+    /// Lock-free: per-outcome atomic depth accumulators, no Mutex on hot path.
+    iterative_depth: DashMap<String, AtomicDepthAccumulator>,
+    /// Low-frequency (background task only), Mutex is acceptable.
     iterative_window_kpis: Mutex<HashMap<String, WindowKpiSnapshot>>,
+    /// Low-frequency (background task only), Mutex is acceptable.
     ns_cache_window_kpis: Mutex<HashMap<String, NsWindowKpiSnapshot>>,
     ip_health_all_unhealthy_events: AtomicU64,
     ip_health_notify_attempt_total: AtomicU64,
     ip_health_notify_fail_total: AtomicU64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            request_total: AtomicU64::new(0),
+            cache_hit_total: AtomicU64::new(0),
+            policy_allowed_total: AtomicU64::new(0),
+            policy_denied_total: AtomicU64::new(0),
+            upstream_query_total: AtomicU64::new(0),
+            healthy_upstreams: AtomicUsize::new(0),
+            reload_success_total: AtomicU64::new(0),
+            reload_failure_total: AtomicU64::new(0),
+            iterative_events: DashMap::new(),
+            ns_host_cache_events: DashMap::new(),
+            iterative_depth: DashMap::new(),
+            iterative_window_kpis: Mutex::new(HashMap::new()),
+            ns_cache_window_kpis: Mutex::new(HashMap::new()),
+            ip_health_all_unhealthy_events: AtomicU64::new(0),
+            ip_health_notify_attempt_total: AtomicU64::new(0),
+            ip_health_notify_fail_total: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Metrics {
@@ -79,40 +167,21 @@ impl Metrics {
 
     /// 导出当前指标快照。
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let iterative_events = self
+        let iterative_events: HashMap<String, u64> = self
             .iterative_events
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        let ns_host_cache_events = self
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+            .collect();
+        let ns_host_cache_events: HashMap<String, u64> = self
             .ns_host_cache_events
-            .lock()
-            .map(|value| value.clone())
-            .unwrap_or_default();
-        let iterative_depth = self
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+            .collect();
+        let iterative_depth: HashMap<String, DepthSnapshot> = self
             .iterative_depth
-            .lock()
-            .map(|depth_map| {
-                depth_map
-                    .iter()
-                    .map(|(key, value)| {
-                        let avg = if value.count > 0 {
-                            value.sum / value.count as f64
-                        } else {
-                            0.0
-                        };
-                        (
-                            key.clone(),
-                            DepthSnapshot {
-                                count: value.count,
-                                avg,
-                                max: value.max,
-                            },
-                        )
-                    })
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().snapshot()))
+            .collect();
         let iterative_window_kpis = self
             .iterative_window_kpis
             .lock()
@@ -183,30 +252,22 @@ impl Metrics {
         self.healthy_upstreams.store(count, Ordering::Relaxed);
     }
 
-    /// 记录一次递归解析事件。
+    /// 记录一次递归解析事件。Lock-free: O(1) atomic increment, no Mutex.
     pub fn record_iterative_event(&self, event: &str) {
-        if let Ok(mut values) = self.iterative_events.lock() {
-            *values.entry(event.to_string()).or_insert(0) += 1;
-        }
+        dashmap_counter_inc(&self.iterative_events, event);
     }
 
-    /// 记录递归解析深度。
+    /// 记录递归解析深度。Lock-free: CAS-loop on atomic f64, no Mutex.
     pub fn observe_iterative_depth(&self, outcome: &str, depth: f64) {
-        if let Ok(mut values) = self.iterative_depth.lock() {
-            let entry = values.entry(outcome.to_string()).or_default();
-            entry.count = entry.count.saturating_add(1);
-            entry.sum += depth;
-            if depth > entry.max {
-                entry.max = depth;
-            }
-        }
+        self.iterative_depth
+            .entry(outcome.to_string())
+            .or_insert_with(AtomicDepthAccumulator::default)
+            .observe(depth);
     }
 
-    /// 记录 NS 主机缓存相关事件。
+    /// 记录 NS 主机缓存相关事件。Lock-free: O(1) atomic increment, no Mutex.
     pub fn record_ns_host_cache(&self, action: &str) {
-        if let Ok(mut values) = self.ns_host_cache_events.lock() {
-            *values.entry(action.to_string()).or_insert(0) += 1;
-        }
+        dashmap_counter_inc(&self.ns_host_cache_events, action);
     }
 
     /// 设置递归窗口 KPI。

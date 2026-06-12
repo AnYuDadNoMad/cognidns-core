@@ -1,7 +1,7 @@
 //! Shared application state injected into ingress and admin handlers.
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -11,9 +11,11 @@ use tracing::info;
 
 use crate::cache::ResponseCache;
 use crate::cache::{CacheDump, CacheImportResult};
+use crate::traits::DnsCache;
 use crate::config::AppConfig;
 use crate::context::RequestContext;
 use crate::dnssec;
+use crate::error::MutexRecover;
 use crate::metrics::Metrics;
 use crate::policy::{PolicyConfig, PolicyDecision, PolicyEngine, PolicySnapshot};
 use crate::resolver::{ResolvedResponse, Resolver, ResolverConfig, ResolverSnapshot};
@@ -81,9 +83,8 @@ impl ReloadAuditState {
 
 #[derive(Clone)]
 pub struct AppState {
-    policy: Arc<RwLock<Arc<PolicyEngine>>>,
-    resolver: Arc<RwLock<Arc<Resolver>>>,
-    response_cache: Arc<ResponseCache>,
+    policy: Arc<ArcSwap<PolicyEngine>>,
+    resolver: Arc<ArcSwap<Resolver>>,
     config_path: Arc<String>,
     reload_audit: Arc<Mutex<ReloadAuditState>>,
     shutdown_notify: Arc<Notify>,
@@ -91,6 +92,7 @@ pub struct AppState {
     pub started_at: Instant,
     top_n: Option<Arc<TopNStats>>,
     top_n_enabled: bool,
+    response_cache: Arc<dyn DnsCache>,
 }
 
 impl AppState {
@@ -117,7 +119,7 @@ impl AppState {
     pub fn new_with_cache(
         policy: PolicyEngine,
         resolver: Resolver,
-        response_cache: Arc<ResponseCache>,
+        response_cache: Arc<dyn DnsCache>,
         metrics: Arc<Metrics>,
         config_path: String,
     ) -> Self {
@@ -135,7 +137,7 @@ impl AppState {
     pub fn new_with_cache_and_topn(
         policy: PolicyEngine,
         resolver: Resolver,
-        response_cache: Arc<ResponseCache>,
+        response_cache: Arc<dyn DnsCache>,
         metrics: Arc<Metrics>,
         config_path: String,
         top_n_enabled: bool,
@@ -148,8 +150,8 @@ impl AppState {
             None
         };
         Self {
-            policy: Arc::new(RwLock::new(Arc::new(policy))),
-            resolver: Arc::new(RwLock::new(Arc::new(resolver))),
+            policy: Arc::new(ArcSwap::new(Arc::new(policy))),
+            resolver: Arc::new(ArcSwap::new(Arc::new(resolver))),
             response_cache,
             config_path: Arc::new(config_path),
             reload_audit: Arc::new(Mutex::new(ReloadAuditState::default())),
@@ -212,13 +214,13 @@ impl AppState {
 
     /// 调用当前策略引擎对请求上下文进行策略评估。
     pub fn policy_evaluate(&self, ctx: &RequestContext) -> PolicyDecision {
-        let policy = self.policy.read().expect("policy state poisoned").clone();
+        let policy = self.policy.load_full();
         policy.evaluate(ctx)
     }
 
     /// 获取当前策略引擎的快照。
     pub fn policy_snapshot(&self) -> PolicySnapshot {
-        let policy = self.policy.read().expect("policy state poisoned").clone();
+        let policy = self.policy.load_full();
         policy.snapshot()
     }
 
@@ -238,37 +240,26 @@ impl AppState {
         request: &[u8],
         matched_view: Option<&str>,
     ) -> anyhow::Result<ResolvedResponse> {
-        let resolver = self
-            .resolver
-            .read()
-            .expect("resolver state poisoned")
-            .clone();
+        let resolver = self.resolver.load_full();
         resolver.resolve_with_view(ctx, request, matched_view).await
     }
 
     /// 获取当前解析器的健康快照。
     pub fn resolver_snapshot(&self) -> ResolverSnapshot {
-        let resolver = self
-            .resolver
-            .read()
-            .expect("resolver state poisoned")
-            .clone();
+        let resolver = self.resolver.load_full();
         resolver.health_snapshot()
     }
 
     /// 返回当前 `Arc<Resolver>` 的克隆，供调用方持有共享引用。
     pub fn get_resolver(&self) -> Arc<Resolver> {
-        self.resolver
-            .read()
-            .expect("resolver state poisoned")
-            .clone()
+        self.resolver.load_full()
     }
 
     /// 获取最近一次 reload 的审计快照。
     pub fn reload_audit_snapshot(&self) -> ReloadAuditSnapshot {
         self.reload_audit
             .lock()
-            .expect("reload audit state poisoned")
+            .recover("reload_audit")
             .snapshot()
     }
 
@@ -300,7 +291,7 @@ impl AppState {
     /// 导出当前缓存快照。
     pub fn export_cache_dump(&self) -> CacheDump {
         self.response_cache
-            .export_dump(|qname| self.response_cache.is_frozen_for_qname(qname))
+            .export_dump(&|qname| self.response_cache.is_frozen_for_qname(qname))
     }
 
     /// 导入缓存快照。
@@ -350,6 +341,10 @@ impl AppState {
                     iterative_fallback_to_forwarder: cfg.iterative_fallback_to_forwarder,
                     iterative_cname_bridge_fallback_to_recursive: cfg
                         .iterative_cname_bridge_fallback_to_recursive,
+                    cname_chain_cache_enabled: cfg.cname_chain_cache_enabled,
+                    cname_chain_inline_cache_enabled: cfg.cname_chain_inline_cache_enabled,
+                    cname_chain_dualstack_share_enabled: cfg.cname_chain_dualstack_share_enabled,
+                    cname_chain_target_prefetch_enabled: cfg.cname_chain_target_prefetch_enabled,
                     ns_host_cache_capacity: cfg.ns_host_cache_capacity,
                     ns_host_cache_ttl_secs: cfg.ns_host_cache_ttl_secs,
                     ns_host_cache_cleanup_interval_ms: cfg.ns_host_cache_cleanup_interval_ms,
@@ -414,13 +409,11 @@ impl AppState {
         };
 
         {
-            let mut guard = self.policy.write().expect("policy state poisoned");
-            *guard = Arc::new(policy);
+            self.policy.store(Arc::new(policy));
         }
         let new_resolver = {
-            let mut guard = self.resolver.write().expect("resolver state poisoned");
             let arc = Arc::new(resolver);
-            *guard = Arc::clone(&arc);
+            self.resolver.store(Arc::clone(&arc));
             arc
         };
         // 热重载后启动 ns_hostnames 异步预热后台任务（不阻塞重载路径）
@@ -453,7 +446,7 @@ impl AppState {
         let mut audit = self
             .reload_audit
             .lock()
-            .expect("reload audit state poisoned");
+            .recover("reload_audit");
         audit.attempt_count += 1;
         if success {
             audit.success_count += 1;

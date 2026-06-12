@@ -2,12 +2,16 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use smol_str::SmolStr;
+
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     pub request_id: u16,
     pub protocol: Protocol,
     pub client_addr: SocketAddr,
-    pub query_name: Option<String>,
+    /// DNS query name. SmolStr avoids heap allocation for names ≤22 bytes
+    /// (covers the vast majority of real-world domains).
+    pub query_name: Option<SmolStr>,
     pub query_type: Option<u16>,
     pub recv_at: Instant,
 }

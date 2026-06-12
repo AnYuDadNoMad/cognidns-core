@@ -1,3 +1,4 @@
+use smol_str::SmolStr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -101,7 +102,7 @@ fn make_request(id: u16, qname: &str, qtype: u16) -> (RequestContext, Vec<u8>) {
         request_id: id,
         protocol: Protocol::Udp,
         client_addr: "127.0.0.1:53001".parse().expect("client addr"),
-        query_name: Some(qname.to_string()),
+        query_name: Some(SmolStr::from(qname)),
         query_type: Some(qtype),
         recv_at: Instant::now(),
     };

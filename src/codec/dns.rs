@@ -409,6 +409,7 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use smol_str::SmolStr;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DnsHeader {
@@ -423,7 +424,7 @@ pub struct DnsHeader {
 #[derive(Debug, Clone)]
 pub struct DnsRequestOverview {
     pub id: u16,
-    pub query_name: Option<String>,
+    pub query_name: Option<SmolStr>,
     pub query_type: Option<u16>,
 }
 
@@ -785,7 +786,7 @@ pub fn parse_request_overview(packet: &[u8]) -> Option<DnsRequestOverview> {
     let question = parse_first_question_from_header(packet, header);
     Some(DnsRequestOverview {
         id: header.id,
-        query_name: question.as_ref().map(|value| value.0.clone()),
+        query_name: question.as_ref().map(|value| SmolStr::from(value.0.as_str())),
         query_type: question.as_ref().map(|value| value.1),
     })
 }
@@ -1113,6 +1114,44 @@ pub fn build_query_like_request(
     let mut packet = build_query(id, name, qtype, rd)?;
     let _ = clone_edns_opt_from_request(template_request, &mut packet);
     Some(packet)
+}
+
+/// Buffer-reusing variant of `build_query`. Clears the buffer and writes the query into it,
+/// avoiding a fresh allocation when queries are built repeatedly (e.g., CNAME chain hops).
+pub fn build_query_into(
+    buffer: &mut Vec<u8>,
+    id: u16,
+    name: &str,
+    qtype: u16,
+    rd: bool,
+) -> Option<()> {
+    buffer.clear();
+    buffer.extend_from_slice(&id.to_be_bytes());
+    let flags = if rd { 0x0100u16 } else { 0u16 };
+    buffer.extend_from_slice(&flags.to_be_bytes());
+    buffer.extend_from_slice(&1u16.to_be_bytes());
+    buffer.extend_from_slice(&0u16.to_be_bytes());
+    buffer.extend_from_slice(&0u16.to_be_bytes());
+    buffer.extend_from_slice(&0u16.to_be_bytes());
+    encode_name(name, buffer)?;
+    buffer.extend_from_slice(&qtype.to_be_bytes());
+    buffer.extend_from_slice(&1u16.to_be_bytes());
+    Some(())
+}
+
+/// Buffer-reusing variant of `build_query_like_request`.
+/// Clears the buffer and writes the query + cloned EDNS opt into it.
+pub fn build_query_like_request_into(
+    buffer: &mut Vec<u8>,
+    template_request: &[u8],
+    id: u16,
+    name: &str,
+    qtype: u16,
+    rd: bool,
+) -> Option<()> {
+    build_query_into(buffer, id, name, qtype, rd)?;
+    let _ = clone_edns_opt_from_request(template_request, buffer);
+    Some(())
 }
 
 pub fn append_edns_opt(packet: &mut Vec<u8>, udp_payload_size: u16, flags: u16) -> Option<()> {
@@ -1585,6 +1624,37 @@ pub fn analyze_referral_targets(packet: &[u8]) -> Option<DnsReferralAnalysis> {
     })
 }
 
+/// Build a map from NS hostname (lowercased, no trailing dot) to glue
+/// endpoint strings by scanning the additional section of a referral packet.
+///
+/// This lets the resolver warm its NS hostname cache from glue records even
+/// when the glue fast-path skips the normal `resolve_ns_hostnames` call.
+pub fn build_ns_hostname_glue_map(
+    packet: &[u8],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let header = match parse_header(packet) {
+        Ok(h) => h,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let mut map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let _ = scan_resource_records(packet, header, |section, record| {
+        if section == DnsSection::Additional && record.rr_class == 1 {
+            if record.rr_type == 1 || record.rr_type == 28 {
+                let owner = record
+                    .owner
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase();
+                if let Some(endpoint) = endpoint_from_rdata(record.rr_type, record.rdata) {
+                    map.entry(owner).or_default().push(endpoint);
+                }
+            }
+        }
+        ControlFlow::<(), ()>::Continue(())
+    });
+    map
+}
+
 fn domain_is_same_or_subdomain_of(name: &str, zone: &str) -> bool {
     let raw_zone = zone.trim();
     if raw_zone == "." {
@@ -1675,6 +1745,12 @@ pub fn extract_authority_ns_hostnames(packet: &[u8]) -> Vec<String> {
 }
 
 pub fn extract_answer_ip_endpoints(packet: &[u8]) -> Vec<String> {
+    extract_answer_ip_endpoints_with_port(packet, 53)
+}
+
+/// Same as `extract_answer_ip_endpoints` but allows overriding the DNS port.
+/// Used by the iterative resolver when a non-standard port is configured (tests).
+pub fn extract_answer_ip_endpoints_with_port(packet: &[u8], port: u16) -> Vec<String> {
     let mut result = Vec::new();
     let Ok(header) = parse_header(packet) else {
         return result;
@@ -1682,7 +1758,9 @@ pub fn extract_answer_ip_endpoints(packet: &[u8]) -> Vec<String> {
 
     if scan_resource_records(packet, header, |section, record| {
         if section == DnsSection::Answer && record.rr_class == 1 {
-            if let Some(endpoint) = endpoint_from_rdata(record.rr_type, record.rdata) {
+            if let Some(endpoint) =
+                endpoint_from_rdata_with_port(record.rr_type, record.rdata, port)
+            {
                 result.push(endpoint);
             }
         }
@@ -2277,15 +2355,20 @@ where
 }
 
 fn endpoint_from_rdata(rr_type: u16, rdata: &[u8]) -> Option<String> {
+    endpoint_from_rdata_with_port(rr_type, rdata, 53)
+}
+
+fn endpoint_from_rdata_with_port(rr_type: u16, rdata: &[u8], port: u16) -> Option<String> {
     match rr_type {
         1 if rdata.len() == 4 => Some(format!(
-            "{}:53",
-            std::net::Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3])
+            "{}:{}",
+            std::net::Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]),
+            port
         )),
         28 if rdata.len() == 16 => {
             let mut octets = [0u8; 16];
             octets.copy_from_slice(rdata);
-            Some(format!("[{}]:53", std::net::Ipv6Addr::from(octets)))
+            Some(format!("[{}]:{}", std::net::Ipv6Addr::from(octets), port))
         }
         _ => None,
     }

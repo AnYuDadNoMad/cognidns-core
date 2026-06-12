@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
+use crate::error::MutexRecover;
+
 /// Width of each time bucket in seconds.
 const BUCKET_SECS: u64 = 60;
 /// Maximum number of historical buckets to keep (= 1 hour lookback).
@@ -112,7 +114,7 @@ impl TopNStats {
         let n = n.clamp(1, 100);
         let window_secs = window_secs.clamp(1, 3600);
 
-        let state = self.state.lock().expect("topn state poisoned");
+        let state = self.state.lock().recover("topn_stats");
         let cutoff = unix_now().saturating_sub(window_secs);
 
         let mut merged: HashMap<String, u64> = HashMap::new();
@@ -144,7 +146,7 @@ impl TopNStats {
         let n = n.clamp(1, 100);
         let window_secs = window_secs.clamp(1, 3600);
 
-        let state = self.state.lock().expect("topn state poisoned");
+        let state = self.state.lock().recover("topn_stats");
         let cutoff = unix_now().saturating_sub(window_secs);
 
         let mut merged: HashMap<String, DomainCounter> = HashMap::new();
@@ -194,7 +196,7 @@ impl TopNStats {
         let n = n.clamp(1, 100);
         let window_secs = window_secs.clamp(1, 3600);
 
-        let state = self.state.lock().expect("topn state poisoned");
+        let state = self.state.lock().recover("topn_stats");
         let cutoff = unix_now().saturating_sub(window_secs);
 
         let mut merged: HashMap<IpAddr, u64> = HashMap::new();
@@ -233,7 +235,7 @@ async fn background_task(mut rx: mpsc::UnboundedReceiver<TopNEvent>, state: Arc<
             batch.push(event);
         }
 
-        let mut st = state.lock().expect("topn state poisoned");
+        let mut st = state.lock().recover("topn_stats");
 
         // Rotate bucket if the current one has aged past BUCKET_SECS.
         if st.current_start.elapsed() >= Duration::from_secs(BUCKET_SECS) {

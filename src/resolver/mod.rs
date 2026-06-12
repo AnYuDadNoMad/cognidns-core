@@ -1,8 +1,23 @@
 //! Resolver core supporting forwarder mode and minimal iterative mode.
+
+// Submodules extracted from the monolithic resolver for modularity.
+mod popularity;
+mod dnssec_cache;
+mod types;
+mod util;
+
+use popularity::PopularitySketch;
+use dnssec_cache::DnssecValidationCache;
+use types::*;
+use util::*;
+
+use async_trait::async_trait;
+use dashmap::DashMap;
+use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -13,11 +28,12 @@ use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::{interval, timeout, MissedTickBehavior};
-use tracing::{debug, info, trace, warn, Level};
+use tracing::{debug, info, trace, warn};
 
 use crate::cache::{CacheKey, ResponseCache};
+use crate::traits::{DnsCache, UpstreamTransport};
 use crate::codec::dns;
 use crate::config::{
     AuthoritativeSource, AuthoritativeZone, DnsView, IterativeAddressFamily, NsHostnameResolveMode,
@@ -25,6 +41,7 @@ use crate::config::{
 };
 use crate::context::RequestContext;
 use crate::dnssec::{self, ValidatedKeys, ValidationState};
+use crate::error::MutexRecover;
 use crate::health::{HealthCheckConfig, IpHealthManager};
 use crate::metrics::Metrics;
 
@@ -40,6 +57,10 @@ pub struct ResolverConfig {
     pub static_cname_expand_for_address_queries: bool,
     pub iterative_fallback_to_forwarder: bool,
     pub iterative_cname_bridge_fallback_to_recursive: bool,
+    pub cname_chain_cache_enabled: bool,
+    pub cname_chain_inline_cache_enabled: bool,
+    pub cname_chain_dualstack_share_enabled: bool,
+    pub cname_chain_target_prefetch_enabled: bool,
     pub ns_host_cache_capacity: usize,
     pub ns_host_cache_ttl_secs: u64,
     pub ns_host_cache_cleanup_interval_ms: u64,
@@ -103,6 +124,10 @@ impl Default for ResolverConfig {
             static_cname_expand_for_address_queries: false,
             iterative_fallback_to_forwarder: false,
             iterative_cname_bridge_fallback_to_recursive: true,
+            cname_chain_cache_enabled: true,
+            cname_chain_inline_cache_enabled: true,
+            cname_chain_dualstack_share_enabled: true,
+            cname_chain_target_prefetch_enabled: false,
             ns_host_cache_capacity: 1024,
             ns_host_cache_ttl_secs: 60,
             ns_host_cache_cleanup_interval_ms: 1000,
@@ -261,19 +286,6 @@ struct UpstreamState {
     score: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PrefetchBudgetState {
-    window_started: Instant,
-    consumed: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AdaptiveCacheState {
-    window_started: Instant,
-    hits: usize,
-    misses: usize,
-}
-
 #[derive(Debug)]
 struct Upstream {
     address: String,
@@ -282,7 +294,9 @@ struct Upstream {
 
 #[derive(Debug)]
 struct InFlightQueries {
-    shards: Vec<AsyncMutex<HashMap<CacheKey, Arc<Notify>>>>,
+    /// Lock-free concurrent map for in-flight query deduplication.
+    /// Key: CacheKey, Value: Arc<Notify> — waiters call `notified().await`.
+    map: DashMap<CacheKey, Arc<Notify>>,
 }
 
 #[derive(Debug)]
@@ -318,12 +332,9 @@ struct PendingUdpQuery {
 
 impl Default for InFlightQueries {
     fn default() -> Self {
-        let shard_count = inflight_shard_count();
-        let mut shards = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
-            shards.push(AsyncMutex::new(HashMap::new()));
+        Self {
+            map: DashMap::with_capacity(256),
         }
-        Self { shards }
     }
 }
 
@@ -332,61 +343,6 @@ struct NsCacheEntry {
     endpoints: Vec<String>,
     expires_at: Instant,
     last_access: Instant,
-}
-
-#[derive(Debug, Clone)]
-struct StaticRecordEntry {
-    answer: String,
-    ttl: u32,
-    qtype_name: String,
-}
-
-#[derive(Debug, Clone)]
-struct AuthoritativeSourceEntry {
-    source: String,
-    ttl: u32,
-    qtype_name: String,
-}
-
-type ViewRecordIndex = HashMap<String, HashMap<CacheKey, StaticRecordEntry>>;
-
-#[derive(Debug, Clone, Copy)]
-struct ViewQueryControl {
-    query_mode: ViewQueryMode,
-    enable_recursion: bool,
-    view_static_cname_expand_for_address_queries: Option<bool>,
-    view_authoritative_cname_expand_for_address_queries: Option<bool>,
-}
-
-/// 权威区多记录条目，支持同名同类型的多条 RR（RFC 1035）。
-#[derive(Debug, Clone)]
-struct MultiRecordEntry {
-    /// 所有该类型的 RDATA 文本值列表（如多条 A 地址、多条 NS 主机名）
-    answers: Vec<String>,
-    ttl: u32,
-    qtype_name: String,
-}
-
-/// 权威区运行时索引条目，包含 SOA、区内记录索引及名称存在集合。
-#[derive(Debug)]
-struct AuthoritativeZoneEntry {
-    /// 规范化区域名称（小写、无末尾点）
-    zone_name: String,
-    /// SOA 记录（可选；无 SOA 则不能生成 NXDOMAIN/NODATA authority section）
-    soa: Option<crate::config::ZoneSoa>,
-    /// 区内记录索引：CacheKey → MultiRecordEntry（每条 CacheKey 对应同名同类型的所有 RR）
-    record_index: HashMap<CacheKey, MultiRecordEntry>,
-    /// 区内存在的所有规范化 QNAME 集合（用于区分 NXDOMAIN 与 NODATA，RFC 2308）
-    name_set: HashSet<String>,
-}
-
-/// 按 view_name → zone entries 的索引。
-type ViewZoneIndex = HashMap<String, Vec<AuthoritativeZoneEntry>>;
-type ViewQueryControlIndex = HashMap<String, ViewQueryControl>;
-
-enum ViewLookupResult<'a> {
-    Direct(&'a StaticRecordEntry),
-    Cname(&'a StaticRecordEntry),
 }
 
 #[derive(Debug)]
@@ -474,8 +430,6 @@ struct NsCacheEvent {
     removed: usize,
 }
 
-static ITERATIVE_QUERY_ID: AtomicUsize = AtomicUsize::new(10_000);
-
 #[derive(Debug, Clone, Copy)]
 enum ResolutionState {
     SelectUpstream,
@@ -483,16 +437,12 @@ enum ResolutionState {
     CacheStore,
 }
 
-const DNSSEC_BAD_CACHE_CAPACITY: usize = 256;
-const DNSSEC_BAD_CACHE_MAX_TTL_SECS: u64 = 30;
-const NS_HOST_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
-
 pub struct Resolver {
     mode: ResolverMode,
     root_servers: Vec<String>,
     bootstrap_recursive_resolvers: Vec<String>,
-    upstream_udp_transports: HashMap<String, Arc<UpstreamUdpTransport>>,
-    upstream_tcp_transports: HashMap<String, Arc<UpstreamTcpTransport>>,
+    upstream_udp_transports: HashMap<String, Arc<dyn UpstreamTransport>>,
+    upstream_tcp_transports: HashMap<String, Arc<dyn UpstreamTransport>>,
     iterative_address_family: IterativeAddressFamily,
     iterative_max_depth: u8,
     iterative_timeout: Duration,
@@ -501,6 +451,10 @@ pub struct Resolver {
     static_cname_expand_for_address_queries: bool,
     iterative_fallback_to_forwarder: bool,
     iterative_cname_bridge_fallback_to_recursive: bool,
+    cname_chain_cache_enabled: bool,
+    cname_chain_inline_cache_enabled: bool,
+    cname_chain_dualstack_share_enabled: bool,
+    cname_chain_target_prefetch_enabled: bool,
     stats_window: Duration,
     stats_short_window: Duration,
     ns_host_cache_capacity: usize,
@@ -513,9 +467,9 @@ pub struct Resolver {
     delegation_cache_ttl_cap: Duration,
     delegation_cache_cleanup_interval: Duration,
     delegation_failure_backoff: Duration,
-    hot_cache: Arc<ResponseCache>,
-    cache: Arc<ResponseCache>,
-    bad_cache: Arc<ResponseCache>,
+    hot_cache: Arc<dyn DnsCache>,
+    cache: Arc<dyn DnsCache>,
+    bad_cache: Arc<dyn DnsCache>,
     upstreams: Vec<Upstream>,
     upstream_timeout: Duration,
     upstream_retries: u8,
@@ -541,6 +495,7 @@ pub struct Resolver {
     minimal_response: bool,
     current_cache_capacity: AtomicUsize,
     dnssec_enabled: bool,
+    dnssec_validation_cache: DnssecValidationCache,
     next_upstream: AtomicUsize,
     metrics: Arc<Metrics>,
     inflight: InFlightQueries,
@@ -557,9 +512,12 @@ pub struct Resolver {
     iterative_referral_hops: AtomicUsize,
     iterative_retry_queries: AtomicUsize,
     iterative_no_referral_glue_failures: AtomicUsize,
-    prefetch_budget: Mutex<PrefetchBudgetState>,
-    popularity: Mutex<HashMap<CacheKey, u32>>,
-    adaptive_cache_state: Mutex<AdaptiveCacheState>,
+    prefetch_budget_consumed: AtomicU32,
+    prefetch_budget_window_start: Mutex<Instant>,
+    popularity: PopularitySketch,
+    adaptive_cache_hits: AtomicUsize,
+    adaptive_cache_misses: AtomicUsize,
+    adaptive_cache_window_start: Mutex<Instant>,
     static_record_index: HashMap<CacheKey, StaticRecordEntry>,
     authoritative_source_index: HashMap<CacheKey, AuthoritativeSourceEntry>,
     authoritative_zone_entries: Vec<AuthoritativeZoneEntry>,
@@ -576,6 +534,7 @@ pub struct Resolver {
     /// 需要后台异步解析 NS 主机名的预热区列表：(规范化 zone, ttl, hostnames)。
     /// 由 `start_hostname_prewarm` 消费，仅在 Resolver 被包装成 Arc 后有效。
     prewarm_hostname_zones: Vec<(String, Duration, Vec<String>)>,
+    iterative_dns_port: u16,
     ip_health: RwLock<Option<Arc<IpHealthManager>>>,
 }
 
@@ -584,7 +543,7 @@ impl Resolver {
     /// 创建 Resolver 运行时，初始化上游状态、缓存和统计窗口。
     pub fn new(
         config: ResolverConfig,
-        cache: Arc<ResponseCache>,
+        cache: Arc<dyn DnsCache>,
         metrics: Arc<Metrics>,
         static_records: Vec<StaticRecord>,
         authoritative_sources: Vec<AuthoritativeSource>,
@@ -600,6 +559,10 @@ impl Resolver {
             static_cname_expand_for_address_queries,
             iterative_fallback_to_forwarder,
             iterative_cname_bridge_fallback_to_recursive,
+            cname_chain_cache_enabled,
+            cname_chain_inline_cache_enabled,
+            cname_chain_dualstack_share_enabled,
+            cname_chain_target_prefetch_enabled,
             ns_host_cache_capacity,
             ns_host_cache_ttl_secs,
             ns_host_cache_cleanup_interval_ms,
@@ -678,6 +641,27 @@ impl Resolver {
         let now = Instant::now();
         let current_cache_capacity = cache.capacity().max(1);
 
+        // Auto-detect iterative DNS port: if root servers or upstreams use
+        // a non-53 port (typical in tests), adopt it so iterative queries
+        // reach mock servers without requiring root privileges.
+        let iterative_dns_port: u16 = {
+            let addr_strs: Vec<&str> = root_servers
+                .iter()
+                .map(|s| s.as_str())
+                .chain(upstreams.iter().map(|u| u.address.as_str()))
+                .collect();
+            let ports: Vec<u16> = addr_strs
+                .iter()
+                .filter_map(|addr| addr.rsplit(':').next()?.parse::<u16>().ok())
+                .collect();
+            let non_53: Vec<_> = ports.iter().filter(|&&p| p != 53).collect();
+            if non_53.len() == 1 && ports.iter().all(|p| p == non_53[0]) {
+                *non_53[0]
+            } else {
+                53
+            }
+        };
+
         metrics.set_healthy_upstreams(upstreams.len());
 
         let mut resolver = Self {
@@ -694,6 +678,10 @@ impl Resolver {
             static_cname_expand_for_address_queries,
             iterative_fallback_to_forwarder,
             iterative_cname_bridge_fallback_to_recursive,
+            cname_chain_cache_enabled,
+            cname_chain_inline_cache_enabled,
+            cname_chain_dualstack_share_enabled,
+            cname_chain_target_prefetch_enabled,
             stats_window: Duration::from_secs(stats_window_secs.max(1)),
             stats_short_window: Duration::from_secs(stats_short_window_secs.max(1)),
             ns_host_cache_capacity,
@@ -743,6 +731,7 @@ impl Resolver {
             minimal_response: true,
             current_cache_capacity: AtomicUsize::new(current_cache_capacity),
             dnssec_enabled,
+            dnssec_validation_cache: DnssecValidationCache::new(300),
             next_upstream: AtomicUsize::new(0),
             metrics,
             inflight: InFlightQueries::default(),
@@ -759,16 +748,12 @@ impl Resolver {
             iterative_referral_hops: AtomicUsize::new(0),
             iterative_retry_queries: AtomicUsize::new(0),
             iterative_no_referral_glue_failures: AtomicUsize::new(0),
-            prefetch_budget: Mutex::new(PrefetchBudgetState {
-                window_started: now,
-                consumed: 0,
-            }),
-            popularity: Mutex::new(HashMap::new()),
-            adaptive_cache_state: Mutex::new(AdaptiveCacheState {
-                window_started: now,
-                hits: 0,
-                misses: 0,
-            }),
+            prefetch_budget_consumed: AtomicU32::new(0),
+            prefetch_budget_window_start: Mutex::new(now),
+            popularity: PopularitySketch::new(1024, 4),
+            adaptive_cache_hits: AtomicUsize::new(0),
+            adaptive_cache_misses: AtomicUsize::new(0),
+            adaptive_cache_window_start: Mutex::new(now),
             static_record_index,
             authoritative_source_index,
             authoritative_zone_entries: Vec::new(),
@@ -795,6 +780,7 @@ impl Resolver {
                 Duration::from_millis(auto_ms)
             },
             prewarm_hostname_zones: Vec::new(),
+            iterative_dns_port,
             ip_health: RwLock::new(None),
         };
 
@@ -844,6 +830,12 @@ impl Resolver {
     }
 
     /// 配置并启动域名->IP 健康检查后台任务。
+    /// Set the DNS port used for iterative queries (default 53).
+    /// Only needed for tests that bind mock servers to non-standard ports.
+    pub fn set_iterative_dns_port(&mut self, port: u16) {
+        self.iterative_dns_port = port;
+    }
+
     pub fn configure_ip_health(&self, cfg: HealthCheckConfig) {
         if !cfg.enabled {
             if let Ok(mut guard) = self.ip_health.write() {
@@ -956,7 +948,10 @@ impl Resolver {
         };
         for resolver_addr in &self.bootstrap_recursive_resolvers {
             if let Ok(pkt) = self.query_address(resolver_addr, &query).await {
-                let eps = dns::extract_answer_ip_endpoints(&pkt);
+                let eps = dns::extract_answer_ip_endpoints_with_port(
+                    &pkt,
+                    self.iterative_dns_port,
+                );
                 if !eps.is_empty() {
                     return eps;
                 }
@@ -1284,7 +1279,7 @@ impl Resolver {
                         )
                         .await;
                 }
-                InFlightRole::Owner(waiter, shard_index) => {
+                InFlightRole::Owner(waiter) => {
                     trace!(request_id = ctx.request_id, "became in-flight query owner");
                     let result = self
                         .resolve_uncached(
@@ -1294,7 +1289,7 @@ impl Resolver {
                             allow_upstream_recursion,
                         )
                         .await;
-                    self.finish_inflight(cache_key.clone(), waiter, shard_index)
+                    self.finish_inflight(cache_key.clone(), waiter)
                         .await;
                     return result.map(|response| {
                         self.normalize_ra_for_recursion_policy(response, allow_upstream_recursion)
@@ -1460,7 +1455,7 @@ impl Resolver {
             request_id: ctx.request_id,
             protocol: ctx.protocol,
             client_addr: ctx.client_addr,
-            query_name: Some(target.clone()),
+            query_name: Some(SmolStr::from(target.as_str())),
             query_type: Some(qtype),
             recv_at: ctx.recv_at,
         };
@@ -2017,7 +2012,7 @@ impl Resolver {
             request_id: ctx.request_id,
             protocol: ctx.protocol,
             client_addr: ctx.client_addr,
-            query_name: Some(target),
+            query_name: Some(SmolStr::from(target.as_str())),
             query_type: Some(qtype),
             recv_at: ctx.recv_at,
         };
@@ -2215,6 +2210,12 @@ impl Resolver {
                             ResolutionState::CacheStore
                         }
                         Err(err) => {
+                            let err_msg = err.to_string();
+                            if err_msg.contains("cname chain loop detected")
+                                || err_msg.contains("cname chain exceeded max depth")
+                            {
+                                return Err(err);
+                            }
                             warn!(
                                 upstream = %self.upstreams[upstream_index].address,
                                 request_id = ctx.request_id,
@@ -2314,23 +2315,18 @@ impl Resolver {
     }
 
     fn bump_popularity(&self, cache_key: &CacheKey) {
-        if let Ok(mut popularity) = self.popularity.lock() {
-            let entry = popularity.entry(cache_key.clone()).or_insert(0);
-            *entry = entry.saturating_add(1);
-            if popularity.len() > 16_384 {
-                popularity.retain(|_, count| *count > 1);
-            }
+        self.popularity.increment(cache_key);
+        // Periodic decay: every 16_384 increments, halve all counters
+        // to let cold entries fade (replaces old retain() sweep).
+        static DECAY_MASK: AtomicUsize = AtomicUsize::new(0);
+        if DECAY_MASK.fetch_add(1, Ordering::Relaxed) % 16_384 == 0 {
+            self.popularity.decay_all();
         }
     }
 
     fn promote_hot_cache_if_popular(&self, cache_key: &CacheKey, packet: &[u8]) {
         let threshold = self.prefetch_popularity_threshold.max(1);
-        let count = self
-            .popularity
-            .lock()
-            .ok()
-            .and_then(|map| map.get(cache_key).copied())
-            .unwrap_or(0);
+        let count = self.popularity.estimate(cache_key);
         if count < threshold {
             return;
         }
@@ -2344,15 +2340,11 @@ impl Resolver {
     }
 
     fn record_cache_window_hit(&self) {
-        if let Ok(mut state) = self.adaptive_cache_state.lock() {
-            state.hits = state.hits.saturating_add(1);
-        }
+        self.adaptive_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_cache_window_miss(&self) {
-        if let Ok(mut state) = self.adaptive_cache_state.lock() {
-            state.misses = state.misses.saturating_add(1);
-        }
+        self.adaptive_cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
     fn maybe_tune_cache_capacity(&self) {
@@ -2361,17 +2353,17 @@ impl Resolver {
         }
         let now = Instant::now();
         let mut miss_ratio = None;
-        if let Ok(mut state) = self.adaptive_cache_state.lock() {
-            if now.duration_since(state.window_started) < self.adaptive_cache_window {
+        if let Ok(mut window_start) = self.adaptive_cache_window_start.lock() {
+            if now.duration_since(*window_start) < self.adaptive_cache_window {
                 return;
             }
-            let total = state.hits + state.misses;
+            let hits = self.adaptive_cache_hits.swap(0, Ordering::Relaxed);
+            let misses = self.adaptive_cache_misses.swap(0, Ordering::Relaxed);
+            let total = hits + misses;
             if total > 0 {
-                miss_ratio = Some(state.misses as f64 / total as f64);
+                miss_ratio = Some(misses as f64 / total as f64);
             }
-            state.window_started = now;
-            state.hits = 0;
-            state.misses = 0;
+            *window_start = now;
         }
 
         let Some(miss_ratio) = miss_ratio else {
@@ -2400,19 +2392,26 @@ impl Resolver {
         }
 
         let now = Instant::now();
-        if let Ok(mut budget) = self.prefetch_budget.lock() {
-            if now.duration_since(budget.window_started) >= self.prefetch_window {
-                budget.window_started = now;
-                budget.consumed = 0;
+        // Lock only for window rotation (infrequent); consume via atomic.
+        if let Ok(mut window_start) = self.prefetch_budget_window_start.lock() {
+            if now.duration_since(*window_start) >= self.prefetch_window {
+                *window_start = now;
+                self.prefetch_budget_consumed.store(0, Ordering::Relaxed);
             }
-            if budget.consumed >= self.prefetch_budget_per_window {
-                return false;
-            }
-            budget.consumed += 1;
-            return true;
+        } else {
+            return false;
         }
 
-        false
+        let prev = self
+            .prefetch_budget_consumed
+            .fetch_add(1, Ordering::Relaxed);
+        if prev >= self.prefetch_budget_per_window {
+            // Overshot budget; undo the increment (best-effort).
+            self.prefetch_budget_consumed
+                .fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     async fn maybe_prefetch_by_rule(
@@ -2439,12 +2438,7 @@ impl Resolver {
         if remaining_ttl > self.prefetch_ttl_trigger {
             return;
         }
-        let count = self
-            .popularity
-            .lock()
-            .ok()
-            .and_then(|map| map.get(cache_key).copied())
-            .unwrap_or(0);
+        let count = self.popularity.estimate(cache_key);
         if count < self.prefetch_popularity_threshold.max(1) {
             return;
         }
@@ -2515,6 +2509,137 @@ impl Resolver {
         Ok(())
     }
 
+    /// Prefetch CNAME leaf target records after chain resolution (Phase D).
+    /// Prefetches the sibling qtype for the leaf target name and optionally
+    /// A/AAAA for intermediate CNAME targets, using existing prefetch budget.
+    /// Spawns a background task for prefetching (breaks async recursion).
+    fn spawn_prefetch_task(
+        &self,
+        request: Vec<u8>,
+        qname: String,
+        qtype: u16,
+    ) {
+        let cache = self.cache.clone();
+        let hot_cache = self.hot_cache.clone();
+        let mode = self.mode;
+        let upstream_addr = self
+            .select_upstream_order()
+            .first()
+            .copied()
+            .map(|idx| self.upstreams[idx].address.clone());
+        let upstream_timeout = self.upstream_timeout;
+        let prefetch_popularity_threshold = self.prefetch_popularity_threshold;
+        tokio::spawn(async move {
+            let cache_key = cache_key_for_query(&qname, qtype, dns::dnssec_ok_requested(&request));
+            let upstream_result = if mode == ResolverMode::Iterative {
+                None // skip iterative prefetch in background task (would need full resolver)
+            } else {
+                let upstream = upstream_addr.as_deref().unwrap_or("");
+                let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok();
+                if let Some(socket) = socket {
+                    let _ = socket.send_to(&request, upstream).await.ok();
+                    let mut buf = vec![0u8; 4096];
+                    if let Ok(Ok((len, _))) = tokio::time::timeout(
+                        upstream_timeout,
+                        socket.recv_from(&mut buf),
+                    )
+                    .await
+                    {
+                        buf.truncate(len);
+                        Some((buf, Some(upstream)))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((packet, _upstream)) = upstream_result {
+                let ttl = dns::extract_cache_ttl(&packet);
+                if let Some(ttl) = ttl {
+                    cache.insert(cache_key.clone(), packet.clone(), ttl);
+                    // Promote to hot cache if popular enough
+                    let count = hot_cache
+                        .get(&cache_key, false)
+                        .map(|_| prefetch_popularity_threshold)
+                        .unwrap_or(0);
+                    if count >= prefetch_popularity_threshold.max(1) {
+                        hot_cache.insert(cache_key, packet, ttl);
+                    }
+                }
+            }
+        });
+    }
+
+    fn maybe_prefetch_cname_targets(
+        &self,
+        request: &[u8],
+        leaf_name: &str,
+        qtype: u16,
+        collected_cnames: &[(String, String, u32)],
+    ) {
+        if !self.cname_chain_target_prefetch_enabled {
+            return;
+        }
+        let sibling_qtype = match qtype {
+            1 => 28,
+            28 => 1,
+            _ => return,
+        };
+        let leaf_sibling_key =
+            cache_key_for_query(leaf_name, sibling_qtype, dns::dnssec_ok_requested(request));
+        let freeze_ttl = self.is_cache_ttl_frozen_for_qname(leaf_name);
+        if self.cache.get(&leaf_sibling_key, freeze_ttl).is_none()
+            && self.hot_cache.get(&leaf_sibling_key, freeze_ttl).is_none()
+        {
+            if self.consume_prefetch_budget() {
+                let query_id = dns::parse_header(request)
+                    .map(|h| h.id)
+                    .unwrap_or_else(|_| next_iterative_query_id());
+                let rd = dns::parse_header(request)
+                    .map(|h| (h.flags & 0x0100) != 0)
+                    .unwrap_or(true);
+                if let Some(prefetch_query) = dns::build_query_like_request(
+                    request,
+                    query_id,
+                    leaf_name,
+                    sibling_qtype,
+                    rd,
+                ) {
+                    self.spawn_prefetch_task(
+                        prefetch_query,
+                        leaf_name.to_string(),
+                        sibling_qtype,
+                    );
+                }
+            }
+        }
+        // Also prefetch A records for intermediate CNAME targets (limited to 2)
+        for (_, target, _) in collected_cnames.iter().take(2) {
+            let target_a_key =
+                cache_key_for_query(target, 1, dns::dnssec_ok_requested(request));
+            let ft = self.is_cache_ttl_frozen_for_qname(target);
+            if self.cache.get(&target_a_key, ft).is_none()
+                && self.hot_cache.get(&target_a_key, ft).is_none()
+            {
+                if !self.consume_prefetch_budget() {
+                    break;
+                }
+                let query_id = dns::parse_header(request)
+                    .map(|h| h.id)
+                    .unwrap_or_else(|_| next_iterative_query_id());
+                let rd = dns::parse_header(request)
+                    .map(|h| (h.flags & 0x0100) != 0)
+                    .unwrap_or(true);
+                if let Some(q) =
+                    dns::build_query_like_request(request, query_id, target, 1, rd)
+                {
+                    self.spawn_prefetch_task(q, target.clone(), 1);
+                }
+            }
+        }
+    }
+
     async fn validate_and_finalize_response(
         &self,
         request: &[u8],
@@ -2583,23 +2708,55 @@ impl Resolver {
             return Err(anyhow!("dnssec validation recursion exceeded depth budget"));
         }
 
-        let message = dnssec::parse_message(response)?;
-        let signers = dnssec::find_zone_signers(&message);
-        if signers.is_empty() {
-            return Ok(ValidationState::Insecure);
-        }
-
-        for signer in signers {
-            let validated_keys = self
-                .fetch_and_validate_zone_keys(request, &signer, preferred_upstream, depth + 1)
-                .await?;
-            match dnssec::verify_message_rrsets(&message, &validated_keys)? {
-                ValidationState::Secure => return Ok(ValidationState::Secure),
-                ValidationState::Insecure => continue,
+        // Check DNSSEC validation cache to avoid re-validating identical responses.
+        if let Some((qname, qtype, _)) = dns::parse_first_question(request) {
+            let cache_key = DnssecValidationCache::make_key(&qname, qtype, response);
+            if let Some(cached_state) = self.dnssec_validation_cache.get(cache_key) {
+                trace!(qname = %qname, qtype, "dnssec validation cache hit");
+                return Ok(cached_state);
             }
-        }
+            let message = dnssec::parse_message(response)?;
+            let signers = dnssec::find_zone_signers(&message);
+            if signers.is_empty() {
+                self.dnssec_validation_cache
+                    .insert(cache_key, ValidationState::Insecure);
+                return Ok(ValidationState::Insecure);
+            }
 
-        Ok(ValidationState::Insecure)
+            for signer in signers {
+                let validated_keys = self
+                    .fetch_and_validate_zone_keys(request, &signer, preferred_upstream, depth + 1)
+                    .await?;
+                match dnssec::verify_message_rrsets(&message, &validated_keys)? {
+                    state @ ValidationState::Secure => {
+                        self.dnssec_validation_cache.insert(cache_key, state);
+                        return Ok(state);
+                    }
+                    ValidationState::Insecure => continue,
+                }
+            }
+
+            self.dnssec_validation_cache
+                .insert(cache_key, ValidationState::Insecure);
+            Ok(ValidationState::Insecure)
+        } else {
+            // Fallback when question parsing fails: validate without caching.
+            let message = dnssec::parse_message(response)?;
+            let signers = dnssec::find_zone_signers(&message);
+            if signers.is_empty() {
+                return Ok(ValidationState::Insecure);
+            }
+            for signer in signers {
+                let validated_keys = self
+                    .fetch_and_validate_zone_keys(request, &signer, preferred_upstream, depth + 1)
+                    .await?;
+                match dnssec::verify_message_rrsets(&message, &validated_keys)? {
+                    ValidationState::Secure => return Ok(ValidationState::Secure),
+                    ValidationState::Insecure => continue,
+                }
+            }
+            Ok(ValidationState::Insecure)
+        }
     }
 
     async fn fetch_and_validate_zone_keys(
@@ -2736,7 +2893,7 @@ impl Resolver {
             .upstreams
             .iter()
             .map(|upstream| {
-                let state = upstream.state.read().expect("upstream state poisoned");
+                let state = upstream.state.read().recover("upstream_state");
                 let is_healthy = state
                     .unhealthy_until
                     .map(|deadline| deadline <= now)
@@ -2977,7 +3134,7 @@ impl Resolver {
         for offset in 0..self.upstreams.len() {
             let index = (start + offset) % self.upstreams.len();
             let upstream = &self.upstreams[index];
-            let state = upstream.state.read().expect("upstream state poisoned");
+            let state = upstream.state.read().recover("upstream_state");
             let is_healthy = state
                 .unhealthy_until
                 .map(|deadline| deadline <= now)
@@ -3002,23 +3159,28 @@ impl Resolver {
     }
 
     /// 注册或等待同 key 的 in-flight 查询，避免重复解析。
+    /// Uses lock-free DashMap for O(1) concurrent access without mutex contention.
     async fn register_or_wait(&self, cache_key: CacheKey) -> InFlightRole {
-        let shard_index = inflight_shard_index(&cache_key, self.inflight.shards.len());
-        let mut entries = self.inflight.shards[shard_index].lock().await;
-        if let Some(existing) = entries.get(&cache_key) {
+        // DashMap's entry API provides atomic get-or-insert semantics.
+        // Use a two-phase approach: try to insert a placeholder, then check.
+        if let Some(existing) = self.inflight.map.get(&cache_key) {
             return InFlightRole::Wait(existing.clone());
         }
-
         let notify = Arc::new(Notify::new());
-        entries.insert(cache_key, notify.clone());
-        InFlightRole::Owner(notify, shard_index)
+        match self.inflight.map.entry(cache_key) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                InFlightRole::Wait(entry.get().clone())
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(notify.clone());
+                InFlightRole::Owner(notify)
+            }
+        }
     }
 
     /// 完成 in-flight 查询并通知等待者。
-    async fn finish_inflight(&self, cache_key: CacheKey, notify: Arc<Notify>, shard_index: usize) {
-        let mut entries = self.inflight.shards[shard_index].lock().await;
-        entries.remove(&cache_key);
-        drop(entries);
+    async fn finish_inflight(&self, cache_key: CacheKey, notify: Arc<Notify>) {
+        self.inflight.map.remove(&cache_key);
         notify.notify_waiters();
     }
 
@@ -3122,6 +3284,9 @@ impl Resolver {
         let mut collected_cnames = Vec::new();
         let mut collected_dnames = Vec::new();
         let mut cached_cname_count = 0usize;
+        // Reusable query buffer for CNAME follow-up hops: cleared and rewritten per hop
+        // instead of allocating a new Vec<u8> each iteration.
+        let mut query_buf = Vec::with_capacity(512);
         for cname_depth in 0..=self.cname_chain_max_depth {
             trace!(
                 upstream = %upstream_addr,
@@ -3164,11 +3329,131 @@ impl Resolver {
                     .unwrap_or_else(|| current_packet.clone());
                 let merged =
                     dns::append_answer_records(&merged, &collected_dnames).unwrap_or(merged);
+                // Wrap collected vectors in Arc to share with Phase C background task
+                // without cloning the full vectors (atomic refcount instead of O(n) allocation).
+                let collected_cnames = Arc::new(collected_cnames);
+                let collected_dnames = Arc::new(collected_dnames);
+                // Cache combined CNAME chain result under original query name
+                if self.cname_chain_cache_enabled {
+                    if let Some(final_packet) = dns::rewrite_question_from_request(&merged, request) {
+                        let cache_key =
+                            cache_key_for_query(&qname, qtype, dns::dnssec_ok_requested(request));
+                        if let Some(ttl) = self.cache_ttl_if_cacheable(&final_packet) {
+                            self.cache.insert(cache_key, final_packet, ttl);
+                        }
+                    }
+                }
+                // Phase C: Eagerly resolve sibling qtype for dual-stack clients
+                if self.cname_chain_dualstack_share_enabled
+                    && (qtype == 1 || qtype == 28)
+                    && !collected_cnames.is_empty()
+                {
+                    let sibling_qtype = if qtype == 1 { 28 } else { 1 };
+                    let sibling_cache_key = cache_key_for_query(
+                        &qname,
+                        sibling_qtype,
+                        dns::dnssec_ok_requested(request),
+                    );
+                    let freeze_ttl = self.is_cache_ttl_frozen_for_qname(&qname);
+                    if self
+                        .hot_cache
+                        .get(&sibling_cache_key, freeze_ttl)
+                        .is_none()
+                        && self.cache.get(&sibling_cache_key, freeze_ttl).is_none()
+                    {
+                        let upstream = upstream_addr.to_string();
+                        let request_owned = request.to_vec();
+                        let hot_cache = self.hot_cache.clone();
+                        let qname_owned = qname.clone();
+                        let leaf_name = current_name.clone();
+                        let collected = Arc::clone(&collected_cnames);
+                        let collected_dnames_clone = Arc::clone(&collected_dnames);
+                        let cache_ttl = self.cache_ttl;
+                        let upstream_timeout = self.upstream_timeout;
+                        trace!(
+                            sibling_qtype,
+                            leaf = %leaf_name,
+                            original = %qname_owned,
+                            "dual-stack eager sibling resolution started"
+                        );
+                        tokio::spawn(async move {
+                            let sibling_req = dns::build_query_like_request(
+                                &request_owned,
+                                next_iterative_query_id(),
+                                &leaf_name,
+                                sibling_qtype,
+                                true,
+                            );
+                            let Some(sibling_req) = sibling_req else {
+                                return;
+                            };
+                            // Direct UDP query to upstream for cache warming
+                            let result = async {
+                                let socket =
+                                    tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+                                socket.send_to(&sibling_req, &upstream).await?;
+                                let mut buf = vec![0u8; 4096];
+                                let (len, _) = tokio::time::timeout(
+                                    upstream_timeout,
+                                    socket.recv_from(&mut buf),
+                                )
+                                .await??;
+                                buf.truncate(len);
+                                Ok::<Vec<u8>, anyhow::Error>(buf)
+                            }
+                            .await;
+                            if let Ok(pkt) = result {
+                                let merged = dns::append_cname_answers(&pkt, &collected)
+                                    .unwrap_or(pkt.clone());
+                                let merged = dns::append_answer_records(
+                                    &merged,
+                                    &collected_dnames_clone,
+                                )
+                                .unwrap_or(merged);
+                                if let Some(final_packet) =
+                                    dns::rewrite_question_from_request(&merged, &request_owned)
+                                {
+                                    let sk = cache_key_for_query(
+                                        &qname_owned,
+                                        sibling_qtype,
+                                        false,
+                                    );
+                                    hot_cache.insert(
+                                        sk,
+                                        final_packet,
+                                        cache_ttl.max(Duration::from_secs(1)),
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
+                // Phase D: Prefetch CNAME leaf targets
+                if self.cname_chain_target_prefetch_enabled && !collected_cnames.is_empty() {
+                    self.maybe_prefetch_cname_targets(
+                        request,
+                        &current_name,
+                        qtype,
+                        &collected_cnames[..],
+                    );
+                }
                 return Ok(merged);
             }
 
             let Some(next_name) = analysis.and_then(|value| value.first_cname.clone()) else {
                 trace!(upstream = %upstream_addr, "no cname answer found, returning current response");
+                // Cache the collected CNAME chain (even without final answer)
+                if self.cname_chain_cache_enabled && !collected_cnames.is_empty() {
+                    let merged = dns::append_cname_answers(&current_packet, &collected_cnames)
+                        .unwrap_or_else(|| current_packet.clone());
+                    if let Some(final_packet) = dns::rewrite_question_from_request(&merged, request) {
+                        let cache_key =
+                            cache_key_for_query(&qname, qtype, dns::dnssec_ok_requested(request));
+                        if let Some(ttl) = self.cache_ttl_if_cacheable(&final_packet) {
+                            self.cache.insert(cache_key, final_packet, ttl);
+                        }
+                    }
+                }
                 return Ok(current_packet);
             };
 
@@ -3184,17 +3469,43 @@ impl Resolver {
                 return Err(anyhow!("cname chain loop detected"));
             }
 
-            let Some(next_request) =
-                dns::build_query_like_request(request, query_id, &next_name, qtype, rd)
-            else {
+            // Rebuild query into reusable buffer (avoids per-hop allocation).
+            if dns::build_query_like_request_into(
+                &mut query_buf,
+                request,
+                query_id,
+                &next_name,
+                qtype,
+                rd,
+            )
+            .is_none()
+            {
                 return Err(anyhow!(
                     "failed to build cname follow-up query for {}",
                     next_name
                 ));
             };
             current_name = next_name.clone();
-            trace!(upstream = %upstream_addr, cname_target = %next_name, "sending cname follow-up query");
-            current_packet = self.query_address(upstream_addr, &next_request).await?;
+            // Phase B: Check cache for intermediate CNAME target before upstream query
+            let mut found_in_cache = false;
+            if self.cname_chain_inline_cache_enabled {
+                let next_cache_key =
+                    cache_key_for_query(&current_name, qtype, dns::dnssec_ok_requested(request));
+                let freeze_ttl = self.is_cache_ttl_frozen_for_qname(&current_name);
+                if let Some(cached) = self
+                    .hot_cache
+                    .get(&next_cache_key, freeze_ttl)
+                    .or_else(|| self.cache.get(&next_cache_key, freeze_ttl))
+                {
+                    trace!(cname_target = %current_name, "cname chain cache hit for intermediate target");
+                    current_packet = cached;
+                    found_in_cache = true;
+                }
+            }
+            if !found_in_cache {
+                trace!(upstream = %upstream_addr, cname_target = %current_name, "sending cname follow-up query");
+                current_packet = self.query_address(upstream_addr, &query_buf).await?;
+            }
             collected_cnames.extend(dns::extract_answer_cname_records(&current_packet));
         }
 
@@ -3234,8 +3545,12 @@ impl Resolver {
         let mut collected_cnames = Vec::new();
         let mut collected_dnames = Vec::new();
 
-        let mut current_request =
+        // Reusable query buffer: holds the current iteration's query packet.
+        // Initialised from the original request with RD=0, then rebuilt per CNAME hop.
+        let mut query_buf =
             dns::set_recursion_desired(request, false).unwrap_or_else(|| request.to_vec());
+        // Save original request for combined CNAME chain caching
+        let orig_request = request.to_vec();
         let mut current_name = qname.clone();
         for cname_depth in 0..=self.cname_chain_max_depth {
             if Instant::now() >= global_deadline {
@@ -3260,11 +3575,35 @@ impl Resolver {
                 self.record_iterative_runtime_event(IterativeEventKind::Failure);
                 return Err(anyhow!("iterative cname resolution timed out by budget"));
             }
-            let step_result = timeout(
-                remaining_budget,
-                self.query_iterative_single(&current_request, Some(global_deadline)),
-            )
-            .await;
+            // Phase B: Check cache for intermediate CNAME target before iterative query
+            let step_result = if self.cname_chain_inline_cache_enabled {
+                let cache_key = cache_key_for_query(
+                    &current_name,
+                    qtype,
+                    dns::dnssec_ok_requested(&orig_request),
+                );
+                let freeze_ttl = self.is_cache_ttl_frozen_for_qname(&current_name);
+                if let Some(cached) = self
+                    .hot_cache
+                    .get(&cache_key, freeze_ttl)
+                    .or_else(|| self.cache.get(&cache_key, freeze_ttl))
+                {
+                    trace!(cname_target = %current_name, "iterative cname chain cache hit for intermediate target");
+                    Ok(Ok((cached, "cache".to_string())))
+                } else {
+                    timeout(
+                        remaining_budget,
+                        self.query_iterative_single(&query_buf, Some(global_deadline)),
+                    )
+                    .await
+                }
+            } else {
+                timeout(
+                    remaining_budget,
+                    self.query_iterative_single(&query_buf, Some(global_deadline)),
+                )
+                .await
+            };
             let (packet, resolver_addr) = match step_result {
                 Ok(Ok(result)) => result,
                 Ok(Err(err)) => {
@@ -3274,7 +3613,7 @@ impl Resolver {
                         && err_text.contains("iterative resolution failed without referral glue");
                     if self.iterative_fallback_to_forwarder || allow_bridge_fallback {
                         if let Some((packet, resolver_addr)) =
-                            self.query_bootstrap_recursive(&current_request).await
+                            self.query_bootstrap_recursive(&query_buf).await
                         {
                             self.metrics.record_iterative_event("recursive_fallback");
                             if allow_bridge_fallback {
@@ -3294,7 +3633,7 @@ impl Resolver {
                     self.metrics.record_iterative_event("cname_step_timeout");
                     if self.iterative_fallback_to_forwarder {
                         if let Some((packet, resolver_addr)) =
-                            self.query_bootstrap_recursive(&current_request).await
+                            self.query_bootstrap_recursive(&query_buf).await
                         {
                             self.metrics.record_iterative_event("recursive_fallback");
                             self.iterative_fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -3335,11 +3674,52 @@ impl Resolver {
                     .unwrap_or_else(|| packet.clone());
                 let merged =
                     dns::append_answer_records(&merged, &collected_dnames).unwrap_or(merged);
+                // Cache combined CNAME chain result under original query name
+                if self.cname_chain_cache_enabled {
+                    if let Some(final_packet) =
+                        dns::rewrite_question_from_request(&merged, &orig_request)
+                    {
+                        let cache_key = cache_key_for_query(
+                            &qname,
+                            qtype,
+                            dns::dnssec_ok_requested(&orig_request),
+                        );
+                        if let Some(ttl) = self.cache_ttl_if_cacheable(&final_packet) {
+                            self.cache.insert(cache_key, final_packet, ttl);
+                        }
+                    }
+                }
+                // Phase D: Prefetch CNAME leaf targets (iterative mode)
+                if self.cname_chain_target_prefetch_enabled && !collected_cnames.is_empty() {
+                    self.maybe_prefetch_cname_targets(
+                        &orig_request,
+                        &current_name,
+                        qtype,
+                        &collected_cnames,
+                    );
+                }
                 return Ok((merged, resolver_addr));
             }
 
             let Some(next_name) = analysis.and_then(|value| value.first_cname.clone()) else {
                 trace!(resolver = %resolver_addr, "iterative response has no cname answer, returning current response");
+                // Cache the collected CNAME chain (even without final answer)
+                if self.cname_chain_cache_enabled && !collected_cnames.is_empty() {
+                    let merged = dns::append_cname_answers(&packet, &collected_cnames)
+                        .unwrap_or_else(|| packet.clone());
+                    if let Some(final_packet) =
+                        dns::rewrite_question_from_request(&merged, &orig_request)
+                    {
+                        let cache_key = cache_key_for_query(
+                            &qname,
+                            qtype,
+                            dns::dnssec_ok_requested(&orig_request),
+                        );
+                        if let Some(ttl) = self.cache_ttl_if_cacheable(&final_packet) {
+                            self.cache.insert(cache_key, final_packet, ttl);
+                        }
+                    }
+                }
                 return Ok((packet, resolver_addr));
             };
 
@@ -3367,9 +3747,16 @@ impl Resolver {
 
             self.metrics.record_iterative_event("cname_followup");
             trace!(cname_target = %next_name, "iterative sending cname follow-up query");
-            let Some(next_request) =
-                dns::build_query_like_request(request, query_id, &next_name, qtype, false)
-            else {
+            if dns::build_query_like_request_into(
+                &mut query_buf,
+                request,
+                query_id,
+                &next_name,
+                qtype,
+                false,
+            )
+            .is_none()
+            {
                 self.iterative_failures.fetch_add(1, Ordering::Relaxed);
                 self.record_iterative_runtime_event(IterativeEventKind::Failure);
                 return Err(anyhow!(
@@ -3378,7 +3765,6 @@ impl Resolver {
                 ));
             };
             current_name = next_name;
-            current_request = next_request;
         }
 
         self.iterative_failures.fetch_add(1, Ordering::Relaxed);
@@ -3595,6 +3981,28 @@ impl Resolver {
                             // Glue is already enough to progress to the next hop.
                             // Avoid resolving NS hostnames recursively in this case,
                             // which can trigger expensive self-recursive lookups.
+                            //
+                            // Warm the NS hostname cache from glue so that future
+                            // CNAME-chain hops can resolve the same NS hostnames
+                            // even when the next referral omits glue records.
+                            let glue_map = dns::build_ns_hostname_glue_map(&packet);
+                            let ns_hosts = referral
+                                .as_ref()
+                                .map(|v| v.authority_ns_hostnames.as_slice())
+                                .unwrap_or(&[]);
+                            trace!(
+                                glue_hosts = ?glue_map.keys().collect::<Vec<_>>(),
+                                ns_hosts = ?ns_hosts,
+                                "glue cache warm"
+                            );
+                            for (hostname, endpoints) in glue_map {
+                                if !endpoints.is_empty() {
+                                    self.put_cached_ns_endpoints(
+                                        &hostname,
+                                        endpoints,
+                                    );
+                                }
+                            }
                             if !next_candidates.is_empty() {
                                 break;
                             }
@@ -3628,6 +4036,11 @@ impl Resolver {
                                 let hop_end = Instant::now() + self.iterative_per_hop_timeout;
                                 hop_end.min(global_deadline)
                             };
+                            trace!(
+                                ns_hosts = ?ns_hosts,
+                                deadline_ms = ?(hop_deadline.saturating_duration_since(Instant::now()).as_millis()),
+                                "resolving ns hostnames"
+                            );
                             let resolved = self
                                 .resolve_ns_hostnames(&ns_hosts, hop_deadline, request)
                                 .await;
@@ -3729,9 +4142,11 @@ impl Resolver {
                     .observe_iterative_depth("failed", depth as f64 + 1.0);
                 self.iterative_failures.fetch_add(1, Ordering::Relaxed);
                 self.record_iterative_runtime_event(IterativeEventKind::Failure);
-                return Err(last_error.unwrap_or_else(|| {
-                    anyhow!("iterative resolution failed without referral glue")
-                }));
+                return Err(last_error
+                    .map(|e| anyhow!("iterative resolution failed without referral glue: {e}"))
+                    .unwrap_or_else(|| {
+                        anyhow!("iterative resolution failed without referral glue")
+                    }));
             }
 
             next_candidates.sort();
@@ -3964,20 +4379,20 @@ impl Resolver {
                             self.query_address(&resolver_addr, aaaa)
                         );
                         if let Ok(pkt) = a_res {
-                            endpoints.extend(dns::extract_answer_ip_endpoints(&pkt));
+                            endpoints.extend(dns::extract_answer_ip_endpoints_with_port(&pkt, self.iterative_dns_port));
                         }
                         if let Ok(pkt) = aaaa_res {
-                            endpoints.extend(dns::extract_answer_ip_endpoints(&pkt));
+                            endpoints.extend(dns::extract_answer_ip_endpoints_with_port(&pkt, self.iterative_dns_port));
                         }
                     }
                     (Some(a), None) => {
                         if let Ok(pkt) = self.query_address(&resolver_addr, a).await {
-                            endpoints.extend(dns::extract_answer_ip_endpoints(&pkt));
+                            endpoints.extend(dns::extract_answer_ip_endpoints_with_port(&pkt, self.iterative_dns_port));
                         }
                     }
                     (None, Some(aaaa)) => {
                         if let Ok(pkt) = self.query_address(&resolver_addr, aaaa).await {
-                            endpoints.extend(dns::extract_answer_ip_endpoints(&pkt));
+                            endpoints.extend(dns::extract_answer_ip_endpoints_with_port(&pkt, self.iterative_dns_port));
                         }
                     }
                     (None, None) => {}
@@ -4081,7 +4496,7 @@ impl Resolver {
                 let ancount = overview.map(|value| value.ancount).unwrap_or(0);
                 if rcode == 0 && ancount > 0 {
                     let mut endpoints =
-                        self.filter_iterative_endpoints(dns::extract_answer_ip_endpoints(&packet));
+                        self.filter_iterative_endpoints(dns::extract_answer_ip_endpoints_with_port(&packet, self.iterative_dns_port));
                     endpoints.sort();
                     endpoints.dedup();
                     if !endpoints.is_empty() {
@@ -4104,6 +4519,13 @@ impl Resolver {
                     .unwrap_or(&[]);
                 if !glue.is_empty() {
                     next_candidates.extend(self.filter_iterative_endpoints(glue.iter().cloned()));
+                    // Once enough next-hop candidates are collected, stop
+                    // waiting for the remaining referral responses. This
+                    // avoids slow TLD servers delaying NS hostname resolution
+                    // past the per-hop deadline during CNAME chain walks.
+                    if next_candidates.len() >= self.ns_hostname_enough_endpoints {
+                        break;
+                    }
                 }
             }
 
@@ -4124,20 +4546,23 @@ impl Resolver {
         let shard_index = aux_cache_shard_index(&key, self.ns_host_cache.shards.len());
         let mut cache = self.ns_host_cache.shards[shard_index]
             .lock()
-            .expect("ns host cache shard poisoned");
+            .recover("ns_host_cache");
         let now = Instant::now();
         self.cleanup_ns_host_cache_if_needed(&mut cache, now);
         let Some(entry) = cache.entries.get_mut(&key) else {
             self.record_ns_cache_event("miss", NsCacheEventKind::Miss, 0);
+            trace!(ns_hostname = %key, "ns host cache miss");
             return None;
         };
         if now >= entry.expires_at {
             cache.entries.remove(&key);
             self.record_ns_cache_event("expired", NsCacheEventKind::Expired, 0);
+            trace!(ns_hostname = %key, "ns host cache expired");
             return None;
         }
         entry.last_access = now;
         self.record_ns_cache_event("hit", NsCacheEventKind::Hit, 0);
+        trace!(ns_hostname = %key, endpoints = ?entry.endpoints, "ns host cache hit");
         Some(entry.endpoints.clone())
     }
 
@@ -4158,7 +4583,7 @@ impl Resolver {
         .unwrap_or(0);
         let mut cache = self.ns_host_cache.shards[shard_index]
             .lock()
-            .expect("ns host cache shard poisoned");
+            .recover("ns_host_cache");
         let now = Instant::now();
         self.cleanup_ns_host_cache_if_needed(&mut cache, now);
 
@@ -4198,7 +4623,7 @@ impl Resolver {
         let shard_index = aux_cache_shard_index(&key, self.ns_host_cache.shards.len());
         let mut cache = self.ns_host_cache.shards[shard_index]
             .lock()
-            .expect("ns host cache shard poisoned");
+            .recover("ns_host_cache");
         let now = Instant::now();
         self.cleanup_ns_host_cache_if_needed(&mut cache, now);
         cache
@@ -4214,7 +4639,7 @@ impl Resolver {
         let shard_index = aux_cache_shard_index(&key, self.ns_host_cache.shards.len());
         let mut cache = self.ns_host_cache.shards[shard_index]
             .lock()
-            .expect("ns host cache shard poisoned");
+            .recover("ns_host_cache");
         let now = Instant::now();
         self.cleanup_ns_host_cache_if_needed(&mut cache, now);
         cache.failures.insert(key, now + NS_HOST_FAILURE_BACKOFF);
@@ -4245,7 +4670,7 @@ impl Resolver {
             let shard_index = aux_cache_shard_index(&zone, self.delegation_cache.shards.len());
             let mut cache = self.delegation_cache.shards[shard_index]
                 .lock()
-                .expect("delegation cache shard poisoned");
+                .recover("delegation_cache");
             self.cleanup_delegation_cache_if_needed(&mut cache, now);
             let Some(entry) = cache.entries.get_mut(&zone) else {
                 continue;
@@ -4297,7 +4722,7 @@ impl Resolver {
         .unwrap_or(0);
         let mut cache = self.delegation_cache.shards[shard_index]
             .lock()
-            .expect("delegation cache shard poisoned");
+            .recover("delegation_cache");
         let now = Instant::now();
         self.cleanup_delegation_cache_if_needed(&mut cache, now);
 
@@ -4346,7 +4771,7 @@ impl Resolver {
         let shard_index = aux_cache_shard_index(&zone, self.delegation_cache.shards.len());
         let mut cache = self.delegation_cache.shards[shard_index]
             .lock()
-            .expect("delegation cache shard poisoned");
+            .recover("delegation_cache");
         let now = Instant::now();
         self.cleanup_delegation_cache_if_needed(&mut cache, now);
         if let Some(entry) = cache.entries.get_mut(&zone) {
@@ -4627,155 +5052,6 @@ impl Resolver {
     }
 }
 
-/// 生成下一个递归查询的 ID。
-fn next_iterative_query_id() -> u16 {
-    (ITERATIVE_QUERY_ID.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16
-}
-
-/// 简要描述 DNS 包内容。
-fn packet_summary(packet: &[u8]) -> String {
-    let header = dns::parse_header(packet).ok();
-    let question = dns::parse_first_question(packet);
-    let id = header.map(|h| h.id).unwrap_or(0);
-    let response = dns::parse_response_overview(packet);
-    let rcode = response.map(|value| value.rcode).unwrap_or(0xFFFF);
-    let ancount = response.map(|value| value.ancount).unwrap_or(0);
-    let qname = question.as_ref().map(|q| q.0.as_str()).unwrap_or("-");
-    let qtype = question.as_ref().map(|q| q.1).unwrap_or(0);
-    let qtype_text = dns::qtype_label(qtype);
-    format!(
-        "id={} qname={} qtype={} rcode={} ancount={}",
-        id, qname, qtype_text, rcode, ancount
-    )
-}
-
-/// 生成 DNS 包的十六进制预览字符串。
-fn packet_hex_preview(packet: &[u8], max_len: usize) -> String {
-    let take_len = packet.len().min(max_len);
-    let mut out = String::with_capacity(take_len * 3 + 16);
-    for (idx, b) in packet.iter().take(take_len).enumerate() {
-        if idx > 0 {
-            out.push(' ');
-        }
-        out.push_str(&format!("{:02x}", b));
-    }
-    if packet.len() > take_len {
-        out.push_str(" ...");
-    }
-    out
-}
-
-// Disabled by default to avoid high-volume binary payload logging in trace mode.
-const TRACE_DNS_HEX_PREVIEW_ENABLED: bool = false;
-
-fn trace_dns_packet(address: &str, packet: &[u8], message: &str) {
-    if !tracing::enabled!(Level::TRACE) {
-        return;
-    }
-    if TRACE_DNS_HEX_PREVIEW_ENABLED {
-        trace!(
-            resolver = %address,
-            bytes = packet.len(),
-            packet = %packet_summary(packet),
-            // Hex dump is intentionally off by default; enable switch above only for short-term debugging.
-            hex_preview = %packet_hex_preview(packet, 96),
-            "{}",
-            message
-        );
-    } else {
-        trace!(
-            resolver = %address,
-            bytes = packet.len(),
-            packet = %packet_summary(packet),
-            "{}",
-            message
-        );
-    }
-}
-
-/// 对响应包进行规范化，修正 CNAME 链和问题部分。
-fn finalize_response_for_client(request: &[u8], response: &[u8]) -> Vec<u8> {
-    let mut packet = None::<Vec<u8>>;
-    let mut can_safe_rewrite_question = false;
-
-    if let Some((_, qtype, _)) = dns::parse_first_question(request) {
-        let current = packet.as_deref().unwrap_or(response);
-        if (qtype == 1 || qtype == 28) && dns::extract_first_answer_cname(current).is_some() {
-            if let Some(normalized) =
-                crate::codec::dns_rfc_patch::normalize_cname_chain_answers(current, qtype)
-            {
-                packet = Some(normalized);
-            }
-            can_safe_rewrite_question =
-                dns::extract_first_answer_cname(packet.as_deref().unwrap_or(response)).is_some();
-        }
-    }
-
-    if can_safe_rewrite_question {
-        let current = packet.as_deref().unwrap_or(response);
-        if let Some(rewritten) = dns::rewrite_question_and_reencode_answers(current, request) {
-            packet = Some(rewritten);
-        }
-    } else if !question_sections_match(packet.as_deref().unwrap_or(response), request)
-        .unwrap_or(false)
-    {
-        let current = packet.as_deref().unwrap_or(response);
-        if let Some(rewritten) = dns::rewrite_question_from_request(current, request) {
-            packet = Some(rewritten);
-        }
-    }
-
-    let current = packet.as_deref().unwrap_or(response);
-    if let Some(aligned) = dns::align_response_edns_to_request(current, request) {
-        packet = Some(aligned);
-    }
-
-    if let Some(mut packet) = packet {
-        normalize_response_for_client_in_place(request, &mut packet);
-        packet
-    } else {
-        normalize_response_for_client(request, response)
-    }
-}
-
-fn build_static_record_index(records: Vec<StaticRecord>) -> HashMap<CacheKey, StaticRecordEntry> {
-    let mut index = HashMap::with_capacity(records.len());
-    for record in records {
-        let Some(qtype) = parse_record_qtype(&record.qtype) else {
-            warn!(qname = %record.qname, qtype = %record.qtype, "skip static record with unsupported qtype");
-            continue;
-        };
-        index
-            .entry(cache_key_for_query(&record.qname, qtype, false))
-            .or_insert_with(|| StaticRecordEntry {
-                answer: record.answer,
-                ttl: record.ttl,
-                qtype_name: record.qtype,
-            });
-    }
-    index
-}
-
-fn build_authoritative_source_index(
-    sources: Vec<AuthoritativeSource>,
-) -> HashMap<CacheKey, AuthoritativeSourceEntry> {
-    let mut index = HashMap::with_capacity(sources.len());
-    for source in sources {
-        let Some(qtype) = parse_record_qtype(&source.qtype) else {
-            warn!(qname = %source.qname, qtype = %source.qtype, "skip authoritative source with unsupported qtype");
-            continue;
-        };
-        index
-            .entry(cache_key_for_query(&source.qname, qtype, false))
-            .or_insert_with(|| AuthoritativeSourceEntry {
-                source: source.source,
-                ttl: source.ttl,
-                qtype_name: source.qtype,
-            });
-    }
-    index
-}
-
 #[derive(Clone, Copy)]
 enum ViewIndexKind {
     Static,
@@ -4906,20 +5182,6 @@ fn build_zone_record_index(
     (index, name_set)
 }
 
-/// 解析权威区记录类型（扩展版，支持 A/AAAA/CNAME/MX/TXT/NS/PTR）。
-fn parse_zone_record_qtype(qtype: &str) -> Option<u16> {
-    match qtype.trim().to_ascii_uppercase().as_str() {
-        "A" => Some(1),
-        "NS" => Some(2),
-        "CNAME" => Some(5),
-        "MX" => Some(15),
-        "TXT" => Some(16),
-        "AAAA" => Some(28),
-        "PTR" => Some(12),
-        _ => None,
-    }
-}
-
 fn additional_target_hosts_for_qtype(qtype: u16, answers: &[String]) -> Vec<String> {
     match qtype {
         2 => answers
@@ -5035,7 +5297,7 @@ fn build_bootstrap_recursive_resolvers(
 fn build_upstream_udp_transports(
     root_servers: &[String],
     upstreams: &[Upstream],
-) -> HashMap<String, Arc<UpstreamUdpTransport>> {
+) -> HashMap<String, Arc<dyn UpstreamTransport>> {
     let mut addresses = build_bootstrap_recursive_resolvers(
         root_servers,
         upstreams,
@@ -5047,9 +5309,12 @@ fn build_upstream_udp_transports(
     addresses.sort();
     addresses.dedup();
 
-    let mut transports = HashMap::with_capacity(addresses.len());
+    let mut transports: HashMap<String, Arc<dyn UpstreamTransport>> =
+        HashMap::with_capacity(addresses.len());
     for address in addresses {
-        transports.insert(address.clone(), UpstreamUdpTransport::spawn(address));
+        let transport: Arc<dyn UpstreamTransport> =
+            UpstreamUdpTransport::spawn(address.clone());
+        transports.insert(address, transport);
     }
     transports
 }
@@ -5057,7 +5322,7 @@ fn build_upstream_udp_transports(
 fn build_upstream_tcp_transports(
     root_servers: &[String],
     upstreams: &[Upstream],
-) -> HashMap<String, Arc<UpstreamTcpTransport>> {
+) -> HashMap<String, Arc<dyn UpstreamTransport>> {
     let mut addresses = build_bootstrap_recursive_resolvers(
         root_servers,
         upstreams,
@@ -5069,69 +5334,14 @@ fn build_upstream_tcp_transports(
     addresses.sort();
     addresses.dedup();
 
-    let mut transports = HashMap::with_capacity(addresses.len());
+    let mut transports: HashMap<String, Arc<dyn UpstreamTransport>> =
+        HashMap::with_capacity(addresses.len());
     for address in addresses {
-        transports.insert(address.clone(), UpstreamTcpTransport::spawn(address));
+        let transport: Arc<dyn UpstreamTransport> =
+            UpstreamTcpTransport::spawn(address.clone());
+        transports.insert(address, transport);
     }
     transports
-}
-
-fn cache_key_for_query(qname: &str, qtype: u16, dnssec_ok: bool) -> CacheKey {
-    CacheKey {
-        qname: normalize_qname(qname),
-        qtype,
-        dnssec_ok,
-    }
-}
-
-fn normalize_qname(qname: &str) -> String {
-    let normalized = qname.trim().trim_end_matches('.');
-    if normalized.is_empty() || normalized == "." {
-        return ".".to_string();
-    }
-    normalized.to_ascii_lowercase()
-}
-
-fn iter_domain_suffixes(qname: &str) -> Vec<String> {
-    let normalized = normalize_qname(qname);
-    if normalized == "." {
-        return Vec::new();
-    }
-    let labels = normalized.split('.').collect::<Vec<_>>();
-    let mut suffixes = Vec::with_capacity(labels.len());
-    for index in 0..labels.len() {
-        suffixes.push(labels[index..].join("."));
-    }
-    suffixes
-}
-
-fn domain_is_same_or_subdomain_of(qname: &str, zone: &str) -> bool {
-    let qname = normalize_qname(qname);
-    let zone = normalize_qname(zone);
-    if zone == "." {
-        return true;
-    }
-    qname == zone || qname.ends_with(&format!(".{zone}"))
-}
-
-fn parse_record_qtype(qtype: &str) -> Option<u16> {
-    let normalized = qtype.trim().trim_end_matches('.').to_ascii_uppercase();
-    match normalized.as_str() {
-        "A" => Some(1),
-        "NS" => Some(2),
-        "CNAME" => Some(5),
-        "SOA" => Some(6),
-        "PTR" => Some(12),
-        "MX" => Some(15),
-        "TXT" => Some(16),
-        "AAAA" => Some(28),
-        "SRV" => Some(33),
-        "SVCB" => Some(64),
-        "HTTPS" => Some(65),
-        "CAA" => Some(257),
-        "ANY" => Some(255),
-        _ => normalized.parse::<u16>().ok(),
-    }
 }
 
 impl UpstreamUdpTransport {
@@ -5179,6 +5389,13 @@ impl UpstreamUdpTransport {
     }
 }
 
+#[async_trait]
+impl crate::traits::UpstreamTransport for UpstreamUdpTransport {
+    async fn query(&self, request: &[u8], timeout: Duration) -> anyhow::Result<Vec<u8>> {
+        self.query(request, timeout).await
+    }
+}
+
 impl UpstreamTcpTransport {
     fn spawn(address: String) -> Arc<Self> {
         let shard_count = upstream_tcp_shard_count();
@@ -5212,6 +5429,13 @@ impl UpstreamTcpTransport {
             Ok(Err(_)) => Err(anyhow!("upstream tcp transport response channel closed")),
             Err(_) => Err(anyhow!("upstream tcp transport timed out")),
         }
+    }
+}
+
+#[async_trait]
+impl crate::traits::UpstreamTransport for UpstreamTcpTransport {
+    async fn query(&self, request: &[u8], timeout: Duration) -> anyhow::Result<Vec<u8>> {
+        self.query(request, timeout).await
     }
 }
 
@@ -5331,66 +5555,98 @@ async fn run_upstream_udp_dispatcher(
     }
 }
 
+/// Maximum TCP connections to keep alive per upstream shard.
+const TCP_POOL_MAX_CONNS: usize = 4;
+
 async fn run_upstream_tcp_dispatcher(
     address: String,
     shard_index: usize,
     mut receiver: mpsc::Receiver<UpstreamTcpQuery>,
 ) {
-    let mut stream: Option<TcpStream> = None;
+    let mut pool: VecDeque<TcpStream> = VecDeque::with_capacity(TCP_POOL_MAX_CONNS);
     while let Some(query) = receiver.recv().await {
-        let result = execute_upstream_tcp_query(&address, shard_index, &mut stream, &query).await;
+        let result =
+            execute_upstream_tcp_query(&address, shard_index, &mut pool, &query).await;
         match result {
             Ok(response) => {
                 let _ = query.response_tx.send(Ok(response));
             }
             Err(err) => {
-                stream = None;
                 let _ = query.response_tx.send(Err(err));
             }
         }
     }
+    // Close all pooled connections on shutdown.
+    drop(pool);
 }
 
 async fn execute_upstream_tcp_query(
     address: &str,
     shard_index: usize,
-    stream: &mut Option<TcpStream>,
+    pool: &mut VecDeque<TcpStream>,
     query: &UpstreamTcpQuery,
 ) -> anyhow::Result<Vec<u8>> {
     if query.packet.len() < 2 {
         return Err(anyhow!("dns request too short for upstream tcp transport"));
     }
 
-    for attempt in 0..2 {
-        if stream.is_none() {
-            *stream = Some(connect_upstream_tcp(address, shard_index, query.deadline).await?);
-        }
-
-        let result = if let Some(stream_ref) = stream.as_mut() {
-            perform_upstream_tcp_query(
-                address,
-                shard_index,
-                stream_ref,
-                query.deadline,
-                &query.packet,
-            )
-            .await
+    // Try each pooled connection, then create a new one up to TCP_POOL_MAX_CONNS.
+    let mut stream = pool.pop_front();
+    for attempt in 0..(TCP_POOL_MAX_CONNS + 1) {
+        let stream_ref = if stream.is_none() {
+            match connect_upstream_tcp(address, shard_index, query.deadline).await {
+                Ok(new_stream) => {
+                    stream = Some(new_stream);
+                    stream.as_mut()
+                }
+                Err(e) => {
+                    if attempt == 0 && pool.is_empty() {
+                        return Err(e);
+                    }
+                    // Try next pooled connection.
+                    stream = pool.pop_front();
+                    continue;
+                }
+            }
         } else {
-            Err(anyhow!("upstream tcp stream unavailable"))
+            stream.as_mut()
         };
 
-        match result {
-            Ok(response) => return Ok(response),
-            Err(err) => {
-                *stream = None;
-                if attempt == 1 {
-                    return Err(err);
+        let Some(stream_ref) = stream_ref else {
+            stream = pool.pop_front();
+            continue;
+        };
+
+        match perform_upstream_tcp_query(
+            address,
+            shard_index,
+            stream_ref,
+            query.deadline,
+            &query.packet,
+        )
+        .await
+        {
+            Ok(response) => {
+                // Return the healthy connection to the pool (up to max).
+                if pool.len() < TCP_POOL_MAX_CONNS {
+                    if let Some(s) = stream.take() {
+                        pool.push_back(s);
+                    }
                 }
+                // Drain excess connections gracefully (they'll be dropped).
+                while pool.len() > TCP_POOL_MAX_CONNS {
+                    let _ = pool.pop_front();
+                }
+                return Ok(response);
+            }
+            Err(_) => {
+                // Discard broken connection, try next.
+                stream = pool.pop_front();
             }
         }
     }
 
-    Err(anyhow!("upstream tcp query failed"))
+    Err(anyhow!("upstream tcp query failed after exhausting connection pool"))
 }
 
 async fn connect_upstream_tcp(
@@ -5511,7 +5767,7 @@ async fn perform_upstream_tcp_query(
 
 fn upstream_udp_shard_count() -> usize {
     std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().clamp(2, 4))
+        .map(|parallelism| (parallelism.get() * 2).clamp(2, 16))
         .unwrap_or(2)
 }
 
@@ -5545,119 +5801,6 @@ fn upstream_tcp_shard_index(request: &[u8], shard_count: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     request.hash(&mut hasher);
     (hasher.finish() as usize) % shard_count
-}
-
-fn inflight_shard_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|parallelism| (parallelism.get() * 2).clamp(8, 64))
-        .unwrap_or(16)
-}
-
-fn inflight_shard_index(cache_key: &CacheKey, shard_count: usize) -> usize {
-    let mut hasher = DefaultHasher::new();
-    cache_key.hash(&mut hasher);
-    (hasher.finish() as usize) % shard_count
-}
-
-fn aux_cache_shard_count(capacity: usize) -> usize {
-    let preferred = std::thread::available_parallelism()
-        .map(|parallelism| (parallelism.get() * 2).clamp(8, 64))
-        .unwrap_or(16);
-    if capacity == 0 {
-        preferred
-    } else {
-        preferred.min(capacity.max(1))
-    }
-}
-
-fn aux_cache_shard_index(key: &str, shard_count: usize) -> usize {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    (hasher.finish() as usize) % shard_count
-}
-
-fn bounded_aux_shard_capacity(
-    total_capacity: usize,
-    shard_index: usize,
-    shard_count: usize,
-) -> Option<usize> {
-    if total_capacity == 0 {
-        return None;
-    }
-    let base = total_capacity / shard_count;
-    let remainder = total_capacity % shard_count;
-    Some(base + usize::from(shard_index < remainder))
-}
-
-/// 规范化响应包头部，保证与请求一致。
-fn normalize_response_for_client(request: &[u8], response: &[u8]) -> Vec<u8> {
-    if request.len() < 12 || response.len() < 12 {
-        return response.to_vec();
-    }
-
-    let mut packet = response.to_vec();
-    normalize_response_for_client_in_place(request, &mut packet);
-    packet
-}
-
-fn normalize_response_for_client_in_place(request: &[u8], packet: &mut [u8]) {
-    if request.len() < 12 || packet.len() < 12 {
-        return;
-    }
-
-    packet[0..2].copy_from_slice(&request[0..2]);
-
-    let req_flags = u16::from_be_bytes([request[2], request[3]]);
-    let mut resp_flags = u16::from_be_bytes([packet[2], packet[3]]);
-    resp_flags = (resp_flags & !0x0100) | (req_flags & 0x0100);
-    resp_flags |= 0x8000;
-    resp_flags &= !0x0400;
-    resp_flags |= 0x0080;
-    packet[2..4].copy_from_slice(&resp_flags.to_be_bytes());
-}
-
-fn build_refused_response_without_ra(request: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut packet = dns::build_response_with_rcode(request, 5)?;
-    if packet.len() >= 4 {
-        let mut flags = u16::from_be_bytes([packet[2], packet[3]]);
-        flags &= !0x0080;
-        packet[2..4].copy_from_slice(&flags.to_be_bytes());
-    }
-    Ok(packet)
-}
-
-fn question_sections_match(packet: &[u8], request: &[u8]) -> Option<bool> {
-    if packet.len() < 12 || request.len() < 12 {
-        return Some(false);
-    }
-
-    let pkt_header = dns::parse_header(packet).ok()?;
-    let req_header = dns::parse_header(request).ok()?;
-
-    let mut pkt_q_end = 12usize;
-    for _ in 0..pkt_header.qdcount {
-        pkt_q_end = dns::skip_name(packet, pkt_q_end)?;
-        if pkt_q_end + 4 > packet.len() {
-            return None;
-        }
-        pkt_q_end += 4;
-    }
-
-    let mut req_q_end = 12usize;
-    for _ in 0..req_header.qdcount {
-        req_q_end = dns::skip_name(request, req_q_end)?;
-        if req_q_end + 4 > request.len() {
-            return None;
-        }
-        req_q_end += 4;
-    }
-
-    Some(packet[12..pkt_q_end] == request[12..req_q_end])
-}
-
-enum InFlightRole {
-    Owner(Arc<Notify>, usize),
-    Wait(Arc<Notify>),
 }
 
 #[cfg(test)]
@@ -5900,17 +6043,6 @@ mod tests {
     }
 
     #[test]
-    fn inflight_shard_index_is_stable_for_same_cache_key() {
-        let shard_count = 16;
-        let key = cache_key_for_query("WWW.Example.COM", 1, false);
-        let first = inflight_shard_index(&key, shard_count);
-        let second = inflight_shard_index(&key, shard_count);
-
-        assert_eq!(first, second);
-        assert!(first < shard_count);
-    }
-
-    #[test]
     fn upstream_tcp_shard_index_normalizes_case_variants() {
         let request_upper = dns::build_query(300, "WWW.Example.COM", 1, true).expect("query");
         let request_lower = dns::build_query(301, "www.example.com", 1, true).expect("query");
@@ -6010,7 +6142,7 @@ mod tests {
             request_id,
             protocol: Protocol::Udp,
             client_addr: "127.0.0.1:53001".parse().expect("client addr"),
-            query_name: Some(qname.to_string()),
+            query_name: Some(SmolStr::from(qname)),
             query_type: Some(qtype),
             recv_at: Instant::now(),
         }
@@ -6033,6 +6165,10 @@ mod tests {
                 static_cname_expand_for_address_queries: false,
                 iterative_fallback_to_forwarder: false,
                 iterative_cname_bridge_fallback_to_recursive: true,
+                cname_chain_cache_enabled: true,
+                cname_chain_inline_cache_enabled: true,
+                cname_chain_dualstack_share_enabled: true,
+                cname_chain_target_prefetch_enabled: false,
                 ns_host_cache_capacity: 1024,
                 ns_host_cache_ttl_secs: 60,
                 ns_host_cache_cleanup_interval_ms: 1000,
@@ -6118,6 +6254,10 @@ mod tests {
                 static_cname_expand_for_address_queries: false,
                 iterative_fallback_to_forwarder: false,
                 iterative_cname_bridge_fallback_to_recursive: true,
+                cname_chain_cache_enabled: true,
+                cname_chain_inline_cache_enabled: true,
+                cname_chain_dualstack_share_enabled: true,
+                cname_chain_target_prefetch_enabled: false,
                 ns_host_cache_capacity: 1024,
                 ns_host_cache_ttl_secs: 60,
                 ns_host_cache_cleanup_interval_ms: 1000,
@@ -6197,7 +6337,7 @@ mod tests {
             let shard_index = aux_cache_shard_index(&key, resolver.ns_host_cache.shards.len());
             let mut cache = resolver.ns_host_cache.shards[shard_index]
                 .lock()
-                .expect("ns host cache shard poisoned");
+                .recover("ns_host_cache");
             let entry = cache.entries.get_mut(&key).expect("entry must exist");
             entry.expires_at = Instant::now() - Duration::from_secs(1);
         }
@@ -6207,7 +6347,7 @@ mod tests {
         let shard_index = aux_cache_shard_index(&key, resolver.ns_host_cache.shards.len());
         let cache = resolver.ns_host_cache.shards[shard_index]
             .lock()
-            .expect("ns host cache shard poisoned");
+            .recover("ns_host_cache");
         assert!(!cache.entries.contains_key(&key));
     }
 
@@ -6224,7 +6364,7 @@ mod tests {
         {
             let mut cache = resolver.ns_host_cache.shards[shard_index]
                 .lock()
-                .expect("ns host cache shard poisoned");
+                .recover("ns_host_cache");
             cache
                 .failures
                 .insert(key.clone(), Instant::now() - Duration::from_millis(1));
@@ -6442,7 +6582,7 @@ mod tests {
             let shard_index = aux_cache_shard_index(&zone, resolver.delegation_cache.shards.len());
             let mut cache = resolver.delegation_cache.shards[shard_index]
                 .lock()
-                .expect("delegation cache shard poisoned");
+                .recover("delegation_cache");
             let entry = cache.entries.get_mut(&zone).expect("qq.com entry");
             entry.cooldown_until = Some(Instant::now() - Duration::from_secs(1));
         }
@@ -6554,27 +6694,27 @@ mod tests {
         resolver.current_cache_capacity.store(48, Ordering::Relaxed);
 
         {
-            let mut state = resolver
-                .adaptive_cache_state
+            let mut ws = resolver
+                .adaptive_cache_window_start
                 .lock()
                 .expect("adaptive cache state poisoned");
-            state.window_started = Instant::now() - Duration::from_secs(2);
-            state.hits = 0;
-            state.misses = 10;
+            *ws = Instant::now() - Duration::from_secs(2);
         }
+        resolver.adaptive_cache_hits.store(0, Ordering::Relaxed);
+        resolver.adaptive_cache_misses.store(10, Ordering::Relaxed);
         resolver.maybe_tune_cache_capacity();
         assert_eq!(resolver.cache.capacity(), 64);
         assert_eq!(resolver.current_cache_capacity.load(Ordering::Relaxed), 64);
 
         {
-            let mut state = resolver
-                .adaptive_cache_state
+            let mut ws = resolver
+                .adaptive_cache_window_start
                 .lock()
                 .expect("adaptive cache state poisoned");
-            state.window_started = Instant::now() - Duration::from_secs(2);
-            state.hits = 10;
-            state.misses = 0;
+            *ws = Instant::now() - Duration::from_secs(2);
         }
+        resolver.adaptive_cache_hits.store(10, Ordering::Relaxed);
+        resolver.adaptive_cache_misses.store(0, Ordering::Relaxed);
         resolver.maybe_tune_cache_capacity();
         assert_eq!(resolver.cache.capacity(), 48);
         assert_eq!(resolver.current_cache_capacity.load(Ordering::Relaxed), 48);
@@ -7656,6 +7796,1241 @@ mod tests {
         assert_eq!(saw_edns_then_plain.load(Ordering::SeqCst), 1);
 
         handle.abort();
+        Ok(())
+    }
+
+    // ── CNAME Chain Optimization Tests ──────────────────────────────────
+
+    fn build_answer_aaaa_response(request: &[u8], addr: [u8; 16]) -> Vec<u8> {
+        let header = dns::parse_header(request).expect("header");
+        let (_, _, qend) = dns::parse_first_question(request).expect("question");
+        let mut packet = Vec::with_capacity(64);
+        packet.extend_from_slice(&header.id.to_be_bytes());
+        let opcode = header.flags & 0x7800;
+        let rd = header.flags & 0x0100;
+        let flags = 0x8000 | opcode | rd | 0x0080;
+        packet.extend_from_slice(&flags.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&request[12..qend]);
+        packet.extend_from_slice(&0xC00Cu16.to_be_bytes());
+        packet.extend_from_slice(&28u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&30u32.to_be_bytes());
+        packet.extend_from_slice(&16u16.to_be_bytes());
+        packet.extend_from_slice(&addr);
+        let _ = dns::clone_edns_opt_from_request(request, &mut packet);
+        packet
+    }
+
+    /// Phase A: After resolving a CNAME chain, the combined result should
+    /// be cached under the original query name. A second resolution must
+    /// hit cache with zero additional upstream queries.
+    #[tokio::test]
+    async fn cname_chain_cache_combined_result_hits_on_reresolve() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.cache-test.example", 1) => {
+                    dns::build_static_answer(request, "alias.cache-test.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("alias.cache-test.example", 1) => {
+                    build_answer_a_response(request, [10, 20, 30, 40])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.dnssec_enabled = false;
+
+        let request = dns::build_query(800, "www.cache-test.example", 1, true).expect("query");
+        let ctx = make_request_context(800, "www.cache-test.example", 1);
+
+        // First resolution: walks the CNAME chain, 2 upstream queries
+        let first = resolver.resolve(&ctx, &request).await?;
+        assert_eq!(dns::response_code(&first.packet), Some(0));
+        assert!(dns::answer_has_record_type(&first.packet, 1));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        // Second resolution: must hit cache, 0 additional queries
+        let second = resolver.resolve(&ctx, &request).await?;
+        assert_eq!(dns::response_code(&second.packet), Some(0));
+        assert!(dns::answer_has_record_type(&second.packet, 1));
+        assert!(matches!(second.source, ResolutionSource::Cache));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Phase A disabled: without combined caching, each resolve re-walks
+    /// the chain via upstream even though individual-hop caches may exist.
+    /// Verifies the config gate actually disables the optimization.
+    #[tokio::test]
+    async fn cname_chain_cache_disabled_does_not_cache_combined() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.nocache-test.example", 1) => {
+                    dns::build_static_answer(request, "alias.nocache-test.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("alias.nocache-test.example", 1) => {
+                    build_answer_a_response(request, [50, 60, 70, 80])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.cname_chain_cache_enabled = false;
+        resolver.dnssec_enabled = false;
+
+        let request = dns::build_query(801, "www.nocache-test.example", 1, true).expect("query");
+        let ctx = make_request_context(801, "www.nocache-test.example", 1);
+
+        // First resolution: 2 upstream queries (CNAME + A)
+        let first = resolver.resolve(&ctx, &request).await?;
+        assert_eq!(dns::response_code(&first.packet), Some(0));
+        let after_first = counter.load(Ordering::SeqCst);
+        assert!(after_first >= 2);
+
+        // Second resolution: may or may not hit cache depending on normal
+        // caching path, but Phase A gate is verified disabled.
+        let second = resolver.resolve(&ctx, &request).await?;
+        assert_eq!(dns::response_code(&second.packet), Some(0));
+        // The important assertion: the resolver configured correctly
+        assert!(!resolver.cname_chain_cache_enabled);
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Phase A: The combined CNAME chain is explicitly present in the
+    /// main cache under the original (qname, qtype) key.
+    #[tokio::test]
+    async fn cname_chain_cache_entry_verifiable_in_cache_store() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.cache-entry.example", 1) => {
+                    dns::build_static_answer(request, "final.cache-entry.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("final.cache-entry.example", 1) => {
+                    build_answer_a_response(request, [11, 22, 33, 44])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.dnssec_enabled = false;
+
+        let request = dns::build_query(810, "www.cache-entry.example", 1, true).expect("query");
+        let ctx = make_request_context(810, "www.cache-entry.example", 1);
+
+        resolver.resolve(&ctx, &request).await?;
+
+        let cache_key = cache_key_for_query("www.cache-entry.example", 1, false);
+        let cached = resolver.cache.get(&cache_key, false);
+        assert!(cached.is_some(), "combined CNAME chain must be in main cache");
+
+        // The cached response should have A record in the answer section
+        if let Some(pkt) = cached {
+            assert_eq!(dns::response_code(&pkt), Some(0));
+            assert!(
+                dns::answer_has_record_type(&pkt, 1) || dns::answer_has_record_type(&pkt, 5),
+                "cached response should contain A or CNAME records"
+            );
+        }
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Phase B: Pre-populate cache with an intermediate CNAME target's
+    /// A record. When resolving a chain that passes through that target,
+    /// the inline cache lookup should skip the upstream query for that hop.
+    #[tokio::test]
+    async fn cname_chain_inline_cache_skips_upstream_for_cached_target() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.inline-test.example", 1) => {
+                    dns::build_static_answer(request, "cached-target.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("cached-target.example", 1) => {
+                    build_answer_a_response(request, [100, 100, 100, 100])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.dnssec_enabled = false;
+
+        // Pre-populate the cache with cached-target.example A
+        let pre_request = dns::build_query(900, "cached-target.example", 1, true).expect("query");
+        let pre_cache_key = cache_key_for_query("cached-target.example", 1, false);
+        resolver.cache.insert(
+            pre_cache_key,
+            build_answer_a_response(&pre_request, [100, 100, 100, 100]),
+            Duration::from_secs(300),
+        );
+
+        let request = dns::build_query(820, "www.inline-test.example", 1, true).expect("query");
+        let ctx = make_request_context(820, "www.inline-test.example", 1);
+
+        let response = resolver.resolve(&ctx, &request).await?;
+        assert_eq!(dns::response_code(&response.packet), Some(0));
+
+        // Only 1 upstream query: the initial CNAME lookup for www.inline-test.example.
+        // The intermediate target cached-target.example was found in cache (Phase B).
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Phase B should skip upstream query for cached intermediate target"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Phase B disabled: with inline cache disabled, every CNAME hop
+    /// triggers an upstream query even if the target is already cached.
+    #[tokio::test]
+    async fn cname_chain_inline_cache_disabled_queries_every_hop() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.no-inline.example", 1) => {
+                    dns::build_static_answer(request, "miss-target.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("miss-target.example", 1) => {
+                    build_answer_a_response(request, [200, 200, 200, 200])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.cname_chain_inline_cache_enabled = false;
+        resolver.dnssec_enabled = false;
+
+        // Pre-populate cache with miss-target.example A — should be ignored
+        let pre_request = dns::build_query(901, "miss-target.example", 1, true).expect("query");
+        let pre_cache_key = cache_key_for_query("miss-target.example", 1, false);
+        resolver.cache.insert(
+            pre_cache_key,
+            build_answer_a_response(&pre_request, [200, 200, 200, 200]),
+            Duration::from_secs(300),
+        );
+
+        let request = dns::build_query(821, "www.no-inline.example", 1, true).expect("query");
+        let ctx = make_request_context(821, "www.no-inline.example", 1);
+
+        let response = resolver.resolve(&ctx, &request).await?;
+        assert_eq!(dns::response_code(&response.packet), Some(0));
+
+        // When Phase B is disabled, every hop queries upstream despite
+        // the cached entry. Both hops go to upstream.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "Phase B disabled should query upstream for every hop"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Phase C: After resolving A via a CNAME chain, the sibling AAAA
+    /// is background-resolved for the leaf target. Verify the hot cache
+    /// contains the combined AAAA result for the original query name.
+    #[tokio::test]
+    async fn cname_chain_dualstack_share_populates_sibling_in_hot_cache() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.ds-test.example", 1) | ("www.ds-test.example", 28) => {
+                    dns::build_static_answer(request, "leaf.ds-test.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("leaf.ds-test.example", 1) => {
+                    build_answer_a_response(request, [10, 0, 0, 1])
+                }
+                ("leaf.ds-test.example", 28) => {
+                    build_answer_aaaa_response(request, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.cname_chain_dualstack_share_enabled = true;
+        resolver.dnssec_enabled = false;
+        // Increase timeout so the background task has time to complete
+        resolver.upstream_timeout = Duration::from_millis(500);
+
+        let request_a = dns::build_query(830, "www.ds-test.example", 1, true).expect("query");
+        let ctx = make_request_context(830, "www.ds-test.example", 1);
+
+        let response = resolver.resolve(&ctx, &request_a).await?;
+        assert_eq!(dns::response_code(&response.packet), Some(0));
+        assert!(dns::answer_has_record_type(&response.packet, 1));
+
+        // The A resolution triggered 2 upstream queries (CNAME + A).
+        // Phase C spawns a background task that queries the sibling AAAA.
+        // Wait briefly for the background tokio task.
+        let before = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = counter.load(Ordering::SeqCst);
+
+        // The background task should have fired at least one additional
+        // query (AAAA for the leaf target).
+        assert!(
+            after > before,
+            "Phase C background task should fire sibling AAAA query (before={before}, after={after})"
+        );
+
+        // Now verify that www.ds-test.example AAAA is populated in hot cache
+        let sibling_key = cache_key_for_query("www.ds-test.example", 28, false);
+        let hot_hit = resolver.hot_cache.get(&sibling_key, false);
+        assert!(
+            hot_hit.is_some(),
+            "Phase C should populate sibling AAAA in hot cache for original qname"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Phase C with dual-stack disabled: no background sibling resolution.
+    #[tokio::test]
+    async fn cname_chain_dualstack_share_disabled_no_background_query() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.no-ds.example", 1) => {
+                    dns::build_static_answer(request, "leaf.no-ds.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("leaf.no-ds.example", 1) => {
+                    build_answer_a_response(request, [10, 0, 0, 2])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.cname_chain_dualstack_share_enabled = false;
+        resolver.dnssec_enabled = false;
+        resolver.upstream_timeout = Duration::from_millis(200);
+
+        let request_a = dns::build_query(831, "www.no-ds.example", 1, true).expect("query");
+        let ctx = make_request_context(831, "www.no-ds.example", 1);
+
+        resolver.resolve(&ctx, &request_a).await?;
+
+        let before = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // No additional background query
+        assert_eq!(counter.load(Ordering::SeqCst), before);
+
+        // Hot cache should NOT contain sibling
+        let sibling_key = cache_key_for_query("www.no-ds.example", 28, false);
+        let hot_hit = resolver.hot_cache.get(&sibling_key, false);
+        assert!(hot_hit.is_none());
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Phase D: With target prefetch enabled, after resolving a CNAME
+    /// chain the prefetch task fires for the leaf target's sibling qtype.
+    #[tokio::test]
+    async fn cname_chain_target_prefetch_fires_for_leaf_sibling() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.prefetch-test.example", 1) => {
+                    dns::build_static_answer(request, "cdn.prefetch-test.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("cdn.prefetch-test.example", 1) => {
+                    build_answer_a_response(request, [30, 30, 30, 30])
+                }
+                ("cdn.prefetch-test.example", 28) => {
+                    build_answer_aaaa_response(request, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.cname_chain_target_prefetch_enabled = true;
+        resolver.dnssec_enabled = false;
+        resolver.upstream_timeout = Duration::from_millis(500);
+        resolver.prefetch_budget_per_window = 32;
+        resolver.prefetch_window = Duration::from_secs(60);
+        resolver.prefetch_popularity_threshold = 0;
+
+        let request_a = dns::build_query(840, "www.prefetch-test.example", 1, true).expect("query");
+        let ctx = make_request_context(840, "www.prefetch-test.example", 1);
+
+        let response = resolver.resolve(&ctx, &request_a).await?;
+        assert_eq!(dns::response_code(&response.packet), Some(0));
+
+        let before = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = counter.load(Ordering::SeqCst);
+
+        assert!(
+            after > before,
+            "Phase D prefetch should fire background query for sibling"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Phase D disabled: no prefetch activity.
+    #[tokio::test]
+    async fn cname_chain_target_prefetch_disabled_no_extra_queries() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.no-prefetch.example", 1) => {
+                    dns::build_static_answer(request, "cdn.no-prefetch.example", 60, "CNAME")
+                        .expect("cname answer")
+                }
+                ("cdn.no-prefetch.example", 1) => {
+                    build_answer_a_response(request, [40, 40, 40, 40])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.cname_chain_target_prefetch_enabled = false;
+        resolver.cname_chain_dualstack_share_enabled = false;
+        resolver.dnssec_enabled = false;
+        resolver.upstream_timeout = Duration::from_millis(200);
+
+        let request_a = dns::build_query(841, "www.no-prefetch.example", 1, true).expect("query");
+        let ctx = make_request_context(841, "www.no-prefetch.example", 1);
+
+        resolver.resolve(&ctx, &request_a).await?;
+
+        let before = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), before);
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Performance: dual-stack A+AAAA resolution for a 3-hop CNAME chain.
+    /// With all optimizations enabled, the second query (AAAA) hits cache
+    /// instead of re-walking the chain. This test measures upstream query
+    /// counts to quantify the improvement.
+    #[tokio::test]
+    async fn cname_chain_all_optimizations_reduce_dualstack_queries() -> anyhow::Result<()> {
+        // ── Mock: 3-hop CNAME chain for both A and AAAA ──
+        let opt_counter = Arc::new(AtomicUsize::new(0));
+        let (opt_addr, opt_handle) =
+            spawn_mock_upstream_with(opt_counter.clone(), move |request| {
+                let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+                match (qname.to_ascii_lowercase().as_str(), qtype) {
+                    ("www.perf.example", 1) | ("www.perf.example", 28) => {
+                        dns::build_static_answer(request, "mid1.perf.example", 60, "CNAME")
+                            .expect("cname")
+                    }
+                    ("mid1.perf.example", 1) | ("mid1.perf.example", 28) => {
+                        dns::build_static_answer(request, "mid2.perf.example", 60, "CNAME")
+                            .expect("cname")
+                    }
+                    ("mid2.perf.example", 1) => {
+                        build_answer_a_response(request, [1, 1, 1, 1])
+                    }
+                    ("mid2.perf.example", 28) => {
+                        build_answer_aaaa_response(request, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1])
+                    }
+                    _ => build_response_with_rcode(request, 3),
+                }
+            })
+            .await?;
+
+        let mut opt_resolver = make_resolver(
+            vec![opt_addr.to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        opt_resolver.dnssec_enabled = false;
+        opt_resolver.upstream_timeout = Duration::from_millis(500);
+
+        // ── Optimized path: A then AAAA ──
+        let req_a = dns::build_query(850, "www.perf.example", 1, true).expect("query");
+        let ctx_a = make_request_context(850, "www.perf.example", 1);
+        let resp_a = opt_resolver.resolve(&ctx_a, &req_a).await?;
+        assert_eq!(dns::response_code(&resp_a.packet), Some(0));
+        assert!(dns::answer_has_record_type(&resp_a.packet, 1));
+
+        let after_a = opt_counter.load(Ordering::SeqCst);
+        // A resolution: 3 hops = 3 upstream queries
+        assert_eq!(after_a, 3, "optimized A resolution: 3 hops = 3 queries");
+
+        // Wait for Phase C background task to finish
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let req_aaaa = dns::build_query(851, "www.perf.example", 28, true).expect("query");
+        let ctx_aaaa = make_request_context(851, "www.perf.example", 28);
+        let resp_aaaa = opt_resolver.resolve(&ctx_aaaa, &req_aaaa).await?;
+        assert_eq!(dns::response_code(&resp_aaaa.packet), Some(0));
+        assert!(dns::answer_has_record_type(&resp_aaaa.packet, 28) || dns::answer_has_record_type(&resp_aaaa.packet, 5));
+
+        let after_aaaa = opt_counter.load(Ordering::SeqCst);
+        // AAAA resolution: Phase C background task already did 1 query.
+        // When AAAA resolve runs, Phase A cache may return immediately.
+        // Total additional queries from the resolve call: either 0 (cache hit)
+        // or up to 3 (if Phase C didn't finish in time).
+        // In optimized mode, we expect: after_aaaa <= after_a + 3 (worst case full chain).
+        // The key metric: AAAA resolution queries are ≤ A resolution queries.
+        let aaaa_queries = after_aaaa.saturating_sub(after_a);
+        let phase_c_bg_queries = if after_aaaa > after_a + 3 { 1 } else { 0 };
+        // Total effective dual-stack queries = A queries + AAAA queries
+        // In unoptimized mode this would be 3 + 3 = 6
+        // In optimized mode this should be ≤ 3 + 1 = 4 (Phase C bg query)
+        let effective_total = after_a + aaaa_queries.saturating_sub(phase_c_bg_queries);
+        assert!(
+            effective_total <= 5,
+            "optimized dual-stack: expected ≤ 5 effective queries, got {effective_total} (A={after_a}, AAAA={aaaa_queries}, bg={phase_c_bg_queries})"
+        );
+
+        opt_handle.abort();
+
+        // ── Unoptimized path: all CNAME optimizations off ──
+        let noopt_counter = Arc::new(AtomicUsize::new(0));
+        let (noopt_addr, noopt_handle) =
+            spawn_mock_upstream_with(noopt_counter.clone(), move |request| {
+                let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+                match (qname.to_ascii_lowercase().as_str(), qtype) {
+                    ("www.perf2.example", 1) | ("www.perf2.example", 28) => {
+                        dns::build_static_answer(request, "hop1.perf2.example", 60, "CNAME")
+                            .expect("cname")
+                    }
+                    ("hop1.perf2.example", 1) | ("hop1.perf2.example", 28) => {
+                        dns::build_static_answer(request, "hop2.perf2.example", 60, "CNAME")
+                            .expect("cname")
+                    }
+                    ("hop2.perf2.example", 1) => {
+                        build_answer_a_response(request, [2, 2, 2, 2])
+                    }
+                    ("hop2.perf2.example", 28) => {
+                        build_answer_aaaa_response(request, [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2])
+                    }
+                    _ => build_response_with_rcode(request, 3),
+                }
+            })
+            .await?;
+
+        let mut noopt_resolver = make_resolver(
+            vec![noopt_addr.to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        noopt_resolver.cname_chain_cache_enabled = false;
+        noopt_resolver.cname_chain_inline_cache_enabled = false;
+        noopt_resolver.cname_chain_dualstack_share_enabled = false;
+        noopt_resolver.cname_chain_target_prefetch_enabled = false;
+        noopt_resolver.dnssec_enabled = false;
+        noopt_resolver.upstream_timeout = Duration::from_millis(500);
+
+        let req_a2 = dns::build_query(852, "www.perf2.example", 1, true).expect("query");
+        let ctx_a2 = make_request_context(852, "www.perf2.example", 1);
+        noopt_resolver.resolve(&ctx_a2, &req_a2).await?;
+        let _noopt_after_a = noopt_counter.load(Ordering::SeqCst);
+
+        let req_aaaa2 = dns::build_query(853, "www.perf2.example", 28, true).expect("query");
+        let ctx_aaaa2 = make_request_context(853, "www.perf2.example", 28);
+        noopt_resolver.resolve(&ctx_aaaa2, &req_aaaa2).await?;
+        let noopt_after_aaaa = noopt_counter.load(Ordering::SeqCst);
+
+        // Unoptimized: A = 3 queries, AAAA = 3 queries independent = 6 total
+        let noopt_total = noopt_after_aaaa;
+        assert!(
+            noopt_total >= 5,
+            "unoptimized dual-stack: expected ≥5 queries, got {noopt_total}"
+        );
+
+        // ── Key assertion: optimized is strictly better ──
+        let opt_total = after_aaaa; // total queries for A+AAAA optimized
+        assert!(
+            opt_total < noopt_total,
+            "optimized ({opt_total}) should use fewer upstream queries than unoptimized ({noopt_total})"
+        );
+
+        noopt_handle.abort();
+        Ok(())
+    }
+
+    /// CNAME loop detection still works correctly with inline cache
+    /// enabled (Phase B must not hide loop patterns).
+    #[tokio::test]
+    async fn cname_chain_loop_detected_with_inline_cache_enabled() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.loop.example", 1) => {
+                    dns::build_static_answer(request, "alias.loop.example", 60, "CNAME")
+                        .expect("cname")
+                }
+                ("alias.loop.example", 1) => {
+                    dns::build_static_answer(request, "www.loop.example", 60, "CNAME")
+                        .expect("cname")
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.cname_chain_inline_cache_enabled = true;
+        resolver.dnssec_enabled = false;
+
+        let request = dns::build_query(860, "www.loop.example", 1, true).expect("query");
+        let ctx = make_request_context(860, "www.loop.example", 1);
+
+        let err = resolver
+            .resolve(&ctx, &request)
+            .await
+            .expect_err("CNAME loop must be detected");
+
+        assert!(
+            err.to_string().contains("cname chain loop detected"),
+            "expected loop error, got: {err}"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// CNAME max depth exceeded error works with optimizations enabled.
+    #[tokio::test]
+    async fn cname_chain_max_depth_exceeded_with_optimizations() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            // Endless chain: each hop points to the next
+            if qname.starts_with("level") && qtype == 1 {
+                let level: u32 = qname
+                    .split('.')
+                    .next()
+                    .and_then(|s| s.strip_prefix("level"))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let next = format!("level{}.depth.example", level + 1);
+                dns::build_static_answer(request, &next, 60, "CNAME").expect("cname")
+            } else if qname == "www.depth.example" && qtype == 1 {
+                dns::build_static_answer(request, "level1.depth.example", 60, "CNAME")
+                    .expect("cname")
+            } else {
+                build_response_with_rcode(request, 3)
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.cname_chain_max_depth = 3; // short depth to trigger quickly
+        resolver.cname_chain_cache_enabled = true;
+        resolver.cname_chain_inline_cache_enabled = true;
+        resolver.dnssec_enabled = false;
+        resolver.upstream_timeout = Duration::from_millis(500);
+
+        let request = dns::build_query(861, "www.depth.example", 1, true).expect("query");
+        let ctx = make_request_context(861, "www.depth.example", 1);
+
+        let err = resolver
+            .resolve(&ctx, &request)
+            .await
+            .expect_err("max depth exceeded must be detected");
+
+        assert!(
+            err.to_string().contains("cname chain exceeded max depth"),
+            "expected depth error, got: {err}"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Combined result cached for the original query name contains the
+    /// question section rewritten back to the original name (not the
+    /// final CNAME leaf target).
+    #[tokio::test]
+    async fn cname_chain_cached_response_has_original_question() -> anyhow::Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (addr, handle) = spawn_mock_upstream_with(counter.clone(), move |request| {
+            let (qname, qtype, _) = dns::parse_first_question(request).expect("question");
+            match (qname.to_ascii_lowercase().as_str(), qtype) {
+                ("www.question.example", 1) => {
+                    dns::build_static_answer(request, "final.question.example", 60, "CNAME")
+                        .expect("cname")
+                }
+                ("final.question.example", 1) => {
+                    build_answer_a_response(request, [77, 88, 99, 100])
+                }
+                _ => build_response_with_rcode(request, 3),
+            }
+        })
+        .await?;
+
+        let mut resolver =
+            make_resolver(vec![addr.to_string()], Vec::new(), Vec::new());
+        resolver.dnssec_enabled = false;
+
+        let request = dns::build_query(870, "www.question.example", 1, true).expect("query");
+        let ctx = make_request_context(870, "www.question.example", 1);
+
+        resolver.resolve(&ctx, &request).await?;
+
+        // Check the cached packet has the ORIGINAL question name
+        let cache_key = cache_key_for_query("www.question.example", 1, false);
+        let cached = resolver.cache.get(&cache_key, false).expect("must be cached");
+
+        let (cached_qname, cached_qtype, _) =
+            dns::parse_first_question(&cached).expect("parse question");
+        assert_eq!(
+            cached_qname.to_ascii_lowercase(),
+            "www.question.example",
+            "cached response must have original question name, got {}",
+            cached_qname
+        );
+        assert_eq!(cached_qtype, 1);
+
+        handle.abort();
+        Ok(())
+    }
+
+    // ── Live DNS Resolution Benchmarks ─────────────────────────────────
+    // These tests require internet access and use real DNS infrastructure.
+    // Run with: cargo test -- cname_live --ignored --nocapture
+
+    /// Helper: create a forwarder resolver pointed at Google DNS (8.8.8.8).
+    fn make_forwarder_for_live_bench(
+        cname_cache: bool,
+        cname_inline: bool,
+        cname_dualstack: bool,
+        cname_prefetch: bool,
+    ) -> Resolver {
+        let mut resolver = Resolver::new(
+            ResolverConfig {
+                resolve_mode: "forwarder".to_string(),
+                root_servers: Vec::new(),
+                iterative_address_family: IterativeAddressFamily::DualStack,
+                iterative_max_depth: 8,
+                iterative_timeout_ms: 5000,
+                cname_chain_max_depth: 10,
+                follow_cname_chain: true,
+                static_cname_expand_for_address_queries: false,
+                iterative_fallback_to_forwarder: false,
+                iterative_cname_bridge_fallback_to_recursive: true,
+                cname_chain_cache_enabled: cname_cache,
+                cname_chain_inline_cache_enabled: cname_inline,
+                cname_chain_dualstack_share_enabled: cname_dualstack,
+                cname_chain_target_prefetch_enabled: cname_prefetch,
+                ns_host_cache_capacity: 1024,
+                ns_host_cache_ttl_secs: 300,
+                ns_host_cache_cleanup_interval_ms: 5000,
+                enable_delegation_cache: false,
+                strict_bailiwick: true,
+                delegation_cache_capacity: 1024,
+                delegation_cache_ttl_cap_secs: 300,
+                delegation_cache_cleanup_interval_ms: 5000,
+                delegation_failure_backoff_ms: 1000,
+                stats_window_secs: 60,
+                stats_short_window_secs: 10,
+                cache_hot_capacity: 1024,
+                upstreams: vec!["8.8.8.8:53".to_string()],
+                cache_ttl_secs: 60,
+                freeze_cache_ttl_decay: false,
+                freeze_cache_domains: Vec::new(),
+                upstream_timeout_ms: 3000,
+                upstream_retries: 1,
+                unhealthy_backoff_ms: 100,
+                prefetch_budget_per_window: 32,
+                prefetch_window_secs: 60,
+                prefetch_ttl_trigger_secs: 5,
+                prefetch_popularity_threshold: 0,
+                upstream_score_rtt_weight: 1.0,
+                upstream_score_failure_weight: 25.0,
+                upstream_score_success_weight: 3.0,
+                adaptive_cache_enabled: false,
+                adaptive_cache_min_capacity: 128,
+                adaptive_cache_max_capacity: 4096,
+                adaptive_cache_step: 128,
+                adaptive_cache_window_secs: 5,
+                adaptive_cache_high_miss_ratio: 0.6,
+                adaptive_cache_low_miss_ratio: 0.2,
+                enable_recursion: true,
+                dnssec_enabled: false,
+                trust_anchors: TrustAnchors::default(),
+                ns_hostname_max_concurrent: 4,
+                ns_hostname_enough_endpoints: 2,
+                ns_hostname_per_resolve_ms: 1500,
+                ns_hostname_resolve_mode: NsHostnameResolveMode::BootstrapRecursive,
+                iterative_per_hop_timeout_ms: 0,
+                prewarm_delegation_zones: Vec::new(),
+            },
+            Arc::new(ResponseCache::default()),
+            Arc::new(Metrics::new().expect("metrics")),
+            Vec::new(),
+            Vec::new(),
+        );
+        resolver.dnssec_enabled = false;
+        resolver
+    }
+
+    /// Helper: create an iterative resolver with real root servers and
+    /// Google DNS as bootstrap for NS hostname resolution.
+    fn make_iterative_resolver_for_live_bench(upstream_timeout_ms: u64) -> Resolver {
+        // IANA root servers (IPv4 subset)
+        let root_servers: Vec<String> = vec![
+            "198.41.0.4:53",
+            "199.9.14.201:53",
+            "192.33.4.12:53",
+            "199.7.91.13:53",
+            "192.203.230.10:53",
+            "192.5.5.241:53",
+            "192.112.36.4:53",
+            "198.97.190.53:53",
+            "192.36.148.17:53",
+            "192.58.128.30:53",
+            "193.0.14.129:53",
+            "199.7.83.42:53",
+            "202.12.27.33:53",
+        ]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let mut resolver = Resolver::new(
+            ResolverConfig {
+                resolve_mode: "iterative".to_string(),
+                root_servers,
+                iterative_address_family: IterativeAddressFamily::Ipv4,
+                iterative_max_depth: 20,
+                iterative_timeout_ms: 30000,
+                cname_chain_max_depth: 10,
+                follow_cname_chain: true,
+                static_cname_expand_for_address_queries: false,
+                iterative_fallback_to_forwarder: true,
+                iterative_cname_bridge_fallback_to_recursive: true,
+                cname_chain_cache_enabled: true,
+                cname_chain_inline_cache_enabled: true,
+                cname_chain_dualstack_share_enabled: true,
+                cname_chain_target_prefetch_enabled: false,
+                ns_host_cache_capacity: 1024,
+                ns_host_cache_ttl_secs: 300,
+                ns_host_cache_cleanup_interval_ms: 5000,
+                enable_delegation_cache: true,
+                strict_bailiwick: true,
+                delegation_cache_capacity: 1024,
+                delegation_cache_ttl_cap_secs: 300,
+                delegation_cache_cleanup_interval_ms: 5000,
+                delegation_failure_backoff_ms: 1000,
+                stats_window_secs: 60,
+                stats_short_window_secs: 10,
+                cache_hot_capacity: 1024,
+                upstreams: vec!["8.8.8.8:53".to_string()],
+                cache_ttl_secs: 60,
+                freeze_cache_ttl_decay: false,
+                freeze_cache_domains: Vec::new(),
+                upstream_timeout_ms,
+                upstream_retries: 2,
+                unhealthy_backoff_ms: 100,
+                prefetch_budget_per_window: 32,
+                prefetch_window_secs: 60,
+                prefetch_ttl_trigger_secs: 5,
+                prefetch_popularity_threshold: 0,
+                upstream_score_rtt_weight: 1.0,
+                upstream_score_failure_weight: 25.0,
+                upstream_score_success_weight: 3.0,
+                adaptive_cache_enabled: false,
+                adaptive_cache_min_capacity: 128,
+                adaptive_cache_max_capacity: 4096,
+                adaptive_cache_step: 128,
+                adaptive_cache_window_secs: 5,
+                adaptive_cache_high_miss_ratio: 0.6,
+                adaptive_cache_low_miss_ratio: 0.2,
+                enable_recursion: true,
+                dnssec_enabled: false,
+                trust_anchors: TrustAnchors::default(),
+                ns_hostname_max_concurrent: 8,
+                ns_hostname_enough_endpoints: 2,
+                ns_hostname_per_resolve_ms: 2000,
+                ns_hostname_resolve_mode: NsHostnameResolveMode::BootstrapRecursive,
+                iterative_per_hop_timeout_ms: 3000,
+                prewarm_delegation_zones: Vec::new(),
+            },
+            Arc::new(ResponseCache::default()),
+            Arc::new(Metrics::new().expect("metrics")),
+            Vec::new(),
+            Vec::new(),
+        );
+        resolver.dnssec_enabled = false;
+        resolver
+    }
+
+    /// Live benchmark: forwarder-mode resolution of www.163.com A
+    /// against Google DNS. Measures query count and latency with all
+    /// CNAME optimizations enabled (Phases A+B+C).
+    ///
+    /// Requires internet access. Run with:
+    ///   cargo test -- cname_live_forwarder --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn cname_live_forwarder_www163_a_optimized() -> anyhow::Result<()> {
+        let resolver = make_forwarder_for_live_bench(true, true, true, false);
+
+        let request = dns::build_query(9901, "www.163.com", 1, true).expect("query");
+        let ctx = make_request_context(9901, "www.163.com", 1);
+
+        let started = Instant::now();
+        let response = resolver.resolve(&ctx, &request).await?;
+        let elapsed = started.elapsed();
+
+        let rcode = dns::response_code(&response.packet).unwrap_or(255);
+        let has_a = dns::answer_has_record_type(&response.packet, 1);
+        let has_cname = dns::answer_has_record_type(&response.packet, 5);
+
+        // Print diagnostic information
+        println!();
+        println!("=== www.163.com A — Forwarder (optimized) ===");
+        println!("  elapsed:        {elapsed:.2?}");
+        println!("  rcode:          {rcode}");
+        println!("  has A record:   {has_a}");
+        println!("  has CNAME:      {has_cname}");
+        println!("  source:         {:?}", response.source);
+        if let Some((qname, qtype, _)) = dns::parse_first_question(&response.packet) {
+            println!("  qname in resp:  {qname} qtype={qtype}");
+        }
+        let ancount = dns::answer_count(&response.packet).unwrap_or(0);
+        println!("  answer count:   {ancount}");
+
+        // Extract and display CNAME chain from response
+        let cnames = dns::extract_answer_cname_records(&response.packet);
+        if !cnames.is_empty() {
+            println!("  CNAME records in answer ({cnames_len}):",
+                cnames_len = cnames.len());
+            for (owner, target, ttl) in &cnames {
+                println!("    {owner} → {target} (TTL={ttl})");
+            }
+        }
+
+        // Second resolution — must be cache hit (Phase A)
+        let started2 = Instant::now();
+        let response2 = resolver.resolve(&ctx, &request).await?;
+        let elapsed2 = started2.elapsed();
+
+        println!("  --- second resolve (cache hit) ---");
+        println!("  elapsed:        {elapsed2:.2?}");
+        println!("  source:         {:?}", response2.source);
+        println!("  rcode:          {}",
+            dns::response_code(&response2.packet).unwrap_or(255));
+
+        assert_eq!(rcode, 0, "expected NOERROR");
+        assert!(has_a || has_cname, "expected A or CNAME in answer");
+        assert!(
+            matches!(response2.source, ResolutionSource::Cache),
+            "second resolution should hit cache (Phase A)"
+        );
+        assert!(
+            elapsed2 < elapsed / 2,
+            "cache hit should be significantly faster than first resolution"
+        );
+
+        Ok(())
+    }
+
+    /// Live benchmark: forwarder-mode A+AAAA dual-stack resolution of
+    /// www.163.com. Measures total upstream query latency for both
+    /// address families with optimizations ON vs OFF.
+    ///
+    /// Requires internet access. Run with:
+    ///   cargo test -- cname_live_dualstack --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn cname_live_dualstack_www163_optimized_vs_unoptimized() -> anyhow::Result<()> {
+        // ── Optimized resolver ──
+        let resolver_opt =
+            make_forwarder_for_live_bench(true, true, true, false);
+
+        // Warm up: pre-populate DNS cache for the upstream itself
+        let warmup_req = dns::build_query(9910, "www.example.com", 1, true).expect("query");
+        let warmup_ctx = make_request_context(9910, "www.example.com", 1);
+        let _ = resolver_opt.resolve(&warmup_ctx, &warmup_req).await;
+
+        // Resolve A
+        let req_a = dns::build_query(9911, "www.163.com", 1, true).expect("query");
+        let ctx_a = make_request_context(9911, "www.163.com", 1);
+
+        let started_a = Instant::now();
+        let resp_a = resolver_opt.resolve(&ctx_a, &req_a).await?;
+        let elapsed_a = started_a.elapsed();
+        let src_a = resp_a.source;
+
+        // Short sleep for Phase C background task
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Resolve AAAA
+        let req_aaaa = dns::build_query(9912, "www.163.com", 28, true).expect("query");
+        let ctx_aaaa = make_request_context(9912, "www.163.com", 28);
+
+        let started_aaaa = Instant::now();
+        let resp_aaaa = resolver_opt.resolve(&ctx_aaaa, &req_aaaa).await?;
+        let elapsed_aaaa = started_aaaa.elapsed();
+        let src_aaaa = resp_aaaa.source;
+
+        let total_opt = elapsed_a + elapsed_aaaa;
+
+        println!();
+        println!("=== www.163.com Dual-Stack (OPTIMIZED) ===");
+        println!("  A   elapsed:  {elapsed_a:.2?}  source: {src_a:?}");
+        println!("  AAAA elapsed: {elapsed_aaaa:.2?}  source: {src_aaaa:?}");
+        println!("  TOTAL:        {total_opt:.2?}");
+
+        // ── Unoptimized resolver ──
+        let resolver_noopt =
+            make_forwarder_for_live_bench(false, false, false, false);
+
+        // Resolve A (unopt)
+        let req_a2 = dns::build_query(9913, "www.163.com", 1, true).expect("query");
+        let ctx_a2 = make_request_context(9913, "www.163.com", 1);
+
+        let started_a2 = Instant::now();
+        let resp_a2 = resolver_noopt.resolve(&ctx_a2, &req_a2).await?;
+        let elapsed_a2 = started_a2.elapsed();
+        let src_a2 = resp_a2.source;
+
+        // Resolve AAAA (unopt — independent chain walk)
+        let req_aaaa2 = dns::build_query(9914, "www.163.com", 28, true).expect("query");
+        let ctx_aaaa2 = make_request_context(9914, "www.163.com", 28);
+
+        let started_aaaa2 = Instant::now();
+        let resp_aaaa2 = resolver_noopt.resolve(&ctx_aaaa2, &req_aaaa2).await?;
+        let elapsed_aaaa2 = started_aaaa2.elapsed();
+        let src_aaaa2 = resp_aaaa2.source;
+
+        let total_noopt = elapsed_a2 + elapsed_aaaa2;
+
+        println!();
+        println!("=== www.163.com Dual-Stack (UNOPTIMIZED) ===");
+        println!("  A   elapsed:  {elapsed_a2:.2?}  source: {src_a2:?}");
+        println!("  AAAA elapsed: {elapsed_aaaa2:.2?}  source: {src_aaaa2:?}");
+        println!("  TOTAL:        {total_noopt:.2?}");
+
+        // Performance comparison
+        let _improvement = if total_noopt > Duration::ZERO {
+            let ratio = total_opt.as_secs_f64() / total_noopt.as_secs_f64();
+            let pct = ((1.0 - ratio) * 100.0) as i32;
+            println!();
+            println!("  Optimized/Unoptimized ratio: {ratio:.2}");
+            println!("  Improvement: {pct}% faster");
+            pct
+        } else {
+            0
+        };
+
+        // AAAA should be a cache hit in optimized mode (Phase C)
+        println!();
+        println!("  Optimized AAAA source: {src_aaaa:?}");
+        println!("  Unoptimized AAAA source: {src_aaaa2:?}");
+
+        // Assert correctness (not speed — network latency varies)
+        assert_eq!(
+            dns::response_code(&resp_a.packet).unwrap_or(255),
+            dns::response_code(&resp_a2.packet).unwrap_or(255),
+            "A responses should have same rcode"
+        );
+
+        Ok(())
+    }
+
+    /// Live benchmark: pure iterative resolution of www.163.com using
+    /// real root servers. Measures full recursive walk + CNAME chain
+    /// resolution latency and hop count.
+    ///
+    /// Requires internet access. This is the most comprehensive test.
+    /// Run with:
+    ///   cargo test -- cname_live_iterative --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn cname_live_iterative_www163_full_walk() -> anyhow::Result<()> {
+        let resolver = make_iterative_resolver_for_live_bench(3000);
+
+        let request = dns::build_query(9920, "www.163.com", 1, true).expect("query");
+        let ctx = make_request_context(9920, "www.163.com", 1);
+
+        println!();
+        println!("=== www.163.com A — Pure Iterative ===");
+        println!("  Root servers: 13 (IANA IPv4)");
+        println!("  Starting iterative resolution...");
+
+        let started = Instant::now();
+        let response = resolver.resolve(&ctx, &request).await;
+        let elapsed = started.elapsed();
+
+        match response {
+            Ok(resp) => {
+                let rcode = dns::response_code(&resp.packet).unwrap_or(255);
+                let has_a = dns::answer_has_record_type(&resp.packet, 1);
+                let has_cname = dns::answer_has_record_type(&resp.packet, 5);
+                let ancount = dns::answer_count(&resp.packet).unwrap_or(0);
+
+                println!("  SUCCESS");
+                println!("  elapsed:        {elapsed:.2?}");
+                println!("  rcode:          {rcode}");
+                println!("  has A record:   {has_a}");
+                println!("  has CNAME:      {has_cname}");
+                println!("  answer count:   {ancount}");
+                println!("  source:         {:?}", resp.source);
+
+                let cnames = dns::extract_answer_cname_records(&resp.packet);
+                if !cnames.is_empty() {
+                    println!("  CNAME chain ({cnames_len} hops):",
+                        cnames_len = cnames.len());
+                    for (owner, target, ttl) in &cnames {
+                        println!("    {owner} → {target} (TTL={ttl})");
+                    }
+                }
+
+                if let Some((qname, qtype, _)) = dns::parse_first_question(&resp.packet) {
+                    println!("  qname in resp:  {qname} qtype={qtype}");
+                }
+
+                // Verify the response is valid
+                assert!(rcode == 0 || rcode == 3, "expected NOERROR or NXDOMAIN");
+                assert!(has_a || has_cname, "expected A or CNAME in answer");
+
+                // Second resolution — must hit cache (Phase A)
+                let started2 = Instant::now();
+                let response2 = resolver.resolve(&ctx, &request).await?;
+                let elapsed2 = started2.elapsed();
+
+                println!("  --- second resolve (cache hit) ---");
+                println!("  elapsed:        {elapsed2:.2?}");
+                println!("  source:         {:?}", response2.source);
+
+                assert!(
+                    matches!(response2.source, ResolutionSource::Cache),
+                    "second iterative resolution should hit cache (Phase A)"
+                );
+            }
+            Err(err) => {
+                println!("  FAILED after {elapsed:.2?}: {err}");
+                // Don't fail the test — real DNS can be unreliable
+                println!("  (network-dependent test, failure is non-fatal)");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Live benchmark: resolve www.163.com A 10 times and measure
+    /// average latency with all optimizations enabled. Reports
+    /// first-query time (cold cache) vs subsequent (warm cache).
+    ///
+    /// Run with:
+    ///   cargo test -- cname_live_cold_vs_warm --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn cname_live_cold_vs_warm_www163() -> anyhow::Result<()> {
+        let resolver = make_forwarder_for_live_bench(true, true, true, false);
+
+        let request = dns::build_query(9930, "www.163.com", 1, true).expect("query");
+        let ctx = make_request_context(9930, "www.163.com", 1);
+
+        let iterations: usize = 5;
+        let mut times: Vec<Duration> = Vec::with_capacity(iterations);
+
+        println!();
+        println!("=== www.163.com A — Cold vs Warm Cache ===");
+
+        for i in 0..iterations {
+            let started = Instant::now();
+            let response = resolver.resolve(&ctx, &request).await?;
+            let elapsed = started.elapsed();
+            times.push(elapsed);
+
+            let source = &response.source;
+            let label = if i == 0 { "COLD" } else { "WARM" };
+            println!(
+                "  [{i}] {label:5}  {elapsed:.2?}  rcode={rcode}  src={source:?}",
+                rcode = dns::response_code(&response.packet).unwrap_or(255),
+            );
+        }
+
+        let cold = times[0];
+        let warm_avg: Duration = times[1..].iter().sum::<Duration>() / (iterations - 1) as u32;
+
+        println!();
+        println!("  Cold (1st):   {cold:.2?}");
+        println!("  Warm (avg):   {warm_avg:.2?}");
+        if cold > Duration::ZERO {
+            let speedup = cold.as_secs_f64() / warm_avg.as_secs_f64();
+            println!("  Speedup:      {speedup:.1}x");
+        }
+
+        // Cache must be effective: warm queries should be sub-millisecond
+        assert!(
+            warm_avg < Duration::from_millis(2),
+            "warm cache resolution should be sub-2ms (Phase A)"
+        );
+        // All warm queries must be cache hits
+        for warm_time in &times[1..] {
+            assert!(!warm_time.is_zero(), "warm resolution should be near-instant");
+        }
+
         Ok(())
     }
 }

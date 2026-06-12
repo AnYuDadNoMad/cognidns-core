@@ -1,0 +1,41 @@
+# Quick performance benchmark config
+udp_listen = "127.0.0.1:15301"
+tcp_listen = "127.0.0.1:15301"
+admin_listen = "127.0.0.1:18081"
+control_listen = "127.0.0.1:19091"
+control_token = "bench"
+resolve_mode = "forwarder"
+upstreams = ["127.0.0.1:5531"]
+upstream_timeout_ms = 500
+upstream_retries = 0
+response_cache_capacity = 200000
+cache_hot_capacity = 100000
+cache_ttl_secs = 300
+prefetch_budget_per_window = 256
+prefetch_window_secs = 1
+prefetch_ttl_trigger_secs = 8
+prefetch_popularity_threshold = 2
+adaptive_cache_enabled = false
+allow_clients = []
+blocked_domains = []
+rate_limit_per_second = 0
+deny_any_queries = false
+follow_cname_chain = true
+cname_chain_max_depth = 8
+cname_chain_cache_enabled = true
+cname_chain_inline_cache_enabled = true
+cname_chain_dualstack_share_enabled = true
+cname_chain_target_prefetch_enabled = false
+dnssec_enabled = false
+enable_recursion = true
+stats_window_secs = 60
+stats_short_window_secs = 10
+
+[logging]
+enabled = false
+
+[[static_records]]
+qname = "bench.example"
+qtype = "A"
+answer = "203.0.113.10"
+ttl = 300
