@@ -179,6 +179,8 @@ pub async fn serve_udp(socket: UdpSocket, state: AppState) -> anyhow::Result<()>
             }
         };
 
+        let response = dns::truncate_response_for_udp(request, &response).unwrap_or(response);
+
         if let Err(err) = socket.send_to(&response, peer).await {
             error!(client = %peer, "failed to send dns response: {}", err);
         } else {

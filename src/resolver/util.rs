@@ -57,6 +57,19 @@ pub(super) fn iter_domain_suffixes(qname: &str) -> Vec<String> {
     suffixes
 }
 
+pub(super) fn iterative_minimized_qname(qname: &str, depth: usize) -> String {
+    let normalized = normalize_qname(qname);
+    if normalized == "." {
+        return ".".to_string();
+    }
+    let suffixes = iter_domain_suffixes(&normalized);
+    suffixes
+        .into_iter()
+        .rev()
+        .nth(depth)
+        .unwrap_or(normalized)
+}
+
 pub(super) fn domain_is_same_or_subdomain_of(qname: &str, zone: &str) -> bool {
     let qname = normalize_qname(qname);
     let zone = normalize_qname(zone);

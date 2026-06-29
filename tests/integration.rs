@@ -468,6 +468,57 @@ fn build_answer_a_response_with_ttl(request: &[u8], ip: [u8; 4], ttl: u32) -> Ve
     resp
 }
 
+fn build_answer_https_response(request: &[u8], priority: u16, target: &str) -> Vec<u8> {
+    let mut resp = Vec::new();
+    let id = u16::from_be_bytes([request[0], request[1]]);
+    resp.extend_from_slice(&id.to_be_bytes());
+    resp.extend_from_slice(&0x8000u16.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+
+    let qend = dns::parse_first_question(request)
+        .map(|(_, _, end)| end)
+        .unwrap_or(request.len());
+    resp.extend_from_slice(&request[12..qend]);
+
+    resp.extend_from_slice(&[0xC0, 0x0C]);
+    resp.extend_from_slice(&65u16.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&60u32.to_be_bytes());
+    let mut rdata = Vec::new();
+    rdata.extend_from_slice(&priority.to_be_bytes());
+    append_name(&mut rdata, target);
+    resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    resp.extend_from_slice(&rdata);
+    resp
+}
+
+fn build_answer_rr_response(request: &[u8], rr_type: u16, rdata: &[u8]) -> Vec<u8> {
+    let mut resp = Vec::new();
+    let id = u16::from_be_bytes([request[0], request[1]]);
+    resp.extend_from_slice(&id.to_be_bytes());
+    resp.extend_from_slice(&0x8000u16.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+    resp.extend_from_slice(&0u16.to_be_bytes());
+
+    let qend = dns::parse_first_question(request)
+        .map(|(_, _, end)| end)
+        .unwrap_or(request.len());
+    resp.extend_from_slice(&request[12..qend]);
+
+    resp.extend_from_slice(&[0xC0, 0x0C]);
+    resp.extend_from_slice(&rr_type.to_be_bytes());
+    resp.extend_from_slice(&1u16.to_be_bytes());
+    resp.extend_from_slice(&60u32.to_be_bytes());
+    resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    resp.extend_from_slice(rdata);
+    resp
+}
+
 fn build_answer_cname_response(request: &[u8], target: &str) -> Vec<u8> {
     let mut resp = Vec::new();
     let id = u16::from_be_bytes([request[0], request[1]]);
@@ -3758,7 +3809,7 @@ async fn iterative_mode_resolves_multiple_domain_shapes_via_ns_hostname_without_
             request_id: 970 + idx as u16,
             protocol: Protocol::Udp,
             client_addr: "127.0.0.1:53070".parse().unwrap(),
-            query_name: Some(SmolStr::from((*query_name))),
+            query_name: Some(SmolStr::from(*query_name)),
             query_type: Some(1),
             recv_at: std::time::Instant::now(),
         };
@@ -3772,7 +3823,7 @@ async fn iterative_mode_resolves_multiple_domain_shapes_via_ns_hostname_without_
             request_id: 980 + idx as u16,
             protocol: Protocol::Udp,
             client_addr: "127.0.0.1:53071".parse().unwrap(),
-            query_name: Some(SmolStr::from((*cache_key_name))),
+            query_name: Some(SmolStr::from(*cache_key_name)),
             query_type: Some(1),
             recv_at: std::time::Instant::now(),
         };
@@ -3857,7 +3908,7 @@ async fn iterative_mode_caches_mixed_domain_outcomes_with_glue_referral() -> any
             request_id: 990 + idx as u16,
             protocol: Protocol::Udp,
             client_addr: "127.0.0.1:53080".parse().unwrap(),
-            query_name: Some(SmolStr::from((*name))),
+            query_name: Some(SmolStr::from(*name)),
             query_type: Some(1),
             recv_at: std::time::Instant::now(),
         };
@@ -3870,7 +3921,7 @@ async fn iterative_mode_caches_mixed_domain_outcomes_with_glue_referral() -> any
             request_id: 1000 + idx as u16,
             protocol: Protocol::Udp,
             client_addr: "127.0.0.1:53081".parse().unwrap(),
-            query_name: Some(SmolStr::from((*name))),
+            query_name: Some(SmolStr::from(*name)),
             query_type: Some(1),
             recv_at: std::time::Instant::now(),
         };
@@ -4149,7 +4200,7 @@ async fn iterative_mode_batch_multi_zone_domains_resolve_stably() -> anyhow::Res
             request_id: 1400 + idx as u16,
             protocol: Protocol::Udp,
             client_addr: "127.0.0.1:53120".parse().unwrap(),
-            query_name: Some(SmolStr::from((*name))),
+            query_name: Some(SmolStr::from(*name)),
             query_type: Some(1),
             recv_at: std::time::Instant::now(),
         };
@@ -5985,6 +6036,96 @@ async fn forwarder_mode_preserves_dname_alongside_synthesized_cname_chain() -> a
 }
 
 #[tokio::test]
+async fn iterative_mode_resolves_https_via_glue_referral() -> anyhow::Result<()> {
+    let root_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let root_addr = root_socket.local_addr()?;
+    let root_handle = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((len, peer)) = root_socket.recv_from(&mut buf).await {
+            let resp = build_referral_with_glue_response(
+                &buf[..len],
+                "example.com",
+                "ns1.example.com",
+                [127, 0, 0, 65],
+            );
+            let _ = root_socket.send_to(&resp, peer).await;
+        }
+    });
+
+    let auth_socket = UdpSocket::bind((std::net::Ipv4Addr::new(127, 0, 0, 65), 53)).await?;
+    let auth_addr = auth_socket.local_addr()?;
+    let auth_handle = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((len, peer)) = auth_socket.recv_from(&mut buf).await {
+            let qtype = dns::parse_first_question(&buf[..len])
+                .map(|q| q.1)
+                .unwrap_or(1);
+            let resp = if qtype == 65 {
+                build_answer_https_response(&buf[..len], 1, "svc.example.net")
+            } else {
+                build_answer_a_response(&buf[..len], [203, 0, 113, 65])
+            };
+            let _ = auth_socket.send_to(&resp, peer).await;
+        }
+    });
+
+    let state = make_iterative_state_with_budget(
+        vec![root_addr.to_string()],
+        vec![auth_addr.to_string()],
+        3000,
+        6,
+    );
+
+    let request = build_query(961, "svc.example.com", 65);
+    let ctx = RequestContext {
+        request_id: 961,
+        protocol: Protocol::Udp,
+        client_addr: "127.0.0.1:53061".parse().unwrap(),
+        query_name: Some(SmolStr::from("svc.example.com")),
+        query_type: Some(65),
+        recv_at: std::time::Instant::now(),
+    };
+
+    let resolved = state.resolve(&ctx, &request).await?;
+    assert_eq!(dns::response_code(&resolved.packet), Some(0));
+    assert!(dns::answer_has_record_type(&resolved.packet, 65));
+    assert_eq!(dns::answer_count(&resolved.packet), Some(1));
+
+    root_handle.abort();
+    auth_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn forwarder_mode_preserves_svcb_like_modern_type64() -> anyhow::Result<()> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (upstream_addr, upstream_handle) = spawn_mock_upstream_with(counter.clone(), |request| {
+        build_answer_rr_response(request, 64, &[0, 1, 2, 3])
+    })
+    .await?;
+
+    let state = make_state(vec![upstream_addr.to_string()]);
+    let request = build_query(963, "svc.example.com", 64);
+    let ctx = RequestContext {
+        request_id: 963,
+        protocol: Protocol::Udp,
+        client_addr: "127.0.0.1:53063".parse().unwrap(),
+        query_name: Some(SmolStr::from("svc.example.com")),
+        query_type: Some(64),
+        recv_at: std::time::Instant::now(),
+    };
+
+    let resolved = state.resolve(&ctx, &request).await?;
+    assert_eq!(dns::response_code(&resolved.packet), Some(0));
+    assert!(dns::answer_has_record_type(&resolved.packet, 64));
+    assert_eq!(dns::answer_count(&resolved.packet), Some(1));
+    assert!(counter.load(Ordering::SeqCst) >= 1);
+
+    upstream_handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn iterative_mode_rejects_cname_chain_depth_exceeded() -> anyhow::Result<()> {
     let root_socket = UdpSocket::bind("127.0.0.1:0").await?;
     let root_addr = root_socket.local_addr()?;
@@ -7072,5 +7213,50 @@ async fn resolver_upstream_failover_experience() -> anyhow::Result<()> {
     );
 
     handle2.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn iterative_dns64_synthesizes_aaaa_from_a_answer() -> anyhow::Result<()> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let addr = socket.local_addr()?;
+
+    let handle = tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+            let (_, qtype, _) = dns::parse_first_question(&buf[..len]).expect("question");
+            let response = match qtype {
+                1 => build_answer_a_response(&buf[..len], [203, 0, 113, 88]),
+                28 => build_noerror_response(&buf[..len]),
+                _ => build_noerror_response(&buf[..len]),
+            };
+            let _ = socket.send_to(&response, peer).await;
+        }
+    });
+
+    let state = make_iterative_state_with_budget(vec![addr.to_string()], vec![addr.to_string()], 3000, 6);
+
+    let request = build_query(4242, "dns64.example.com", 28);
+    let ctx = RequestContext {
+        request_id: 4242,
+        protocol: Protocol::Udp,
+        client_addr: "127.0.0.1:53042".parse().unwrap(),
+        query_name: Some(SmolStr::from("dns64.example.com")),
+        query_type: Some(28),
+        recv_at: std::time::Instant::now(),
+    };
+
+    let resolved = state.resolve(&ctx, &request).await?;
+    assert_eq!(dns::response_code(&resolved.packet), Some(0));
+    assert!(dns::answer_has_record_type_for_name(
+        &resolved.packet,
+        "dns64.example.com",
+        28
+    ));
+
+    handle.abort();
     Ok(())
 }

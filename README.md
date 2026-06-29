@@ -12,6 +12,8 @@ CogniDNS Core 是独立的高性能 DNS 解析引擎，提供递归解析、策�
 - 策略控制：ACL、黑名单、速率限制、查询策略
 - 运行控制：Agent/Worker 生命周期、热重载、缓存管理
 - 可观测性：health/ready/stats/metrics、TopN 统计、审计日志
+- 已验证解析边界：DNS64 合成、QNAME minimization、DNS Cookies / EDNS 兼容性边界、UDP 截断与 TC、serve-stale
+- 已验证现代记录链路：SVCB / HTTPS 透传、CNAME / DNAME / glue 组合回归
 
 ## 2. 适用场景
 
@@ -91,6 +93,8 @@ cargo run -- ctl stop --all --config config/cognidns.toml
 
 - [用户手册](docs/USER_MANUAL.md)
 - [项目状态](docs/PROJECT_STATUS.md)
+- [现代记录与缓存回归](docs/cname-chain-optimizations.md)
+- [压测基准](docs/performance-benchmark-2026-06-06.md)
 
 ## 7. 与平台协作
 

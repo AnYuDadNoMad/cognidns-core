@@ -17,7 +17,7 @@ use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -95,6 +95,9 @@ pub struct ResolverConfig {
     pub adaptive_cache_high_miss_ratio: f64,
     pub adaptive_cache_low_miss_ratio: f64,
     pub enable_recursion: bool,
+    pub qname_minimization: bool,
+    pub dns64_enabled: bool,
+    pub dns64_prefix: std::net::Ipv6Addr,
     pub dnssec_enabled: bool,
     pub trust_anchors: TrustAnchors,
     /// NS 主机名并发解析上限。
@@ -162,6 +165,9 @@ impl Default for ResolverConfig {
             adaptive_cache_high_miss_ratio: 0.6,
             adaptive_cache_low_miss_ratio: 0.2,
             enable_recursion: true,
+            qname_minimization: true,
+            dns64_enabled: false,
+            dns64_prefix: std::net::Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0),
             dnssec_enabled: true,
             trust_anchors: TrustAnchors::default(),
             ns_hostname_max_concurrent: 4,
@@ -493,6 +499,9 @@ pub struct Resolver {
     adaptive_cache_low_miss_ratio: f64,
     enable_recursion: bool,
     minimal_response: bool,
+    qname_minimization: bool,
+    dns64_enabled: AtomicBool,
+    dns64_prefix: RwLock<std::net::Ipv6Addr>,
     current_cache_capacity: AtomicUsize,
     dnssec_enabled: bool,
     dnssec_validation_cache: DnssecValidationCache,
@@ -597,6 +606,9 @@ impl Resolver {
             adaptive_cache_high_miss_ratio,
             adaptive_cache_low_miss_ratio,
             enable_recursion,
+            qname_minimization,
+            dns64_enabled,
+            dns64_prefix,
             dnssec_enabled,
             trust_anchors,
             ns_hostname_max_concurrent,
@@ -728,7 +740,10 @@ impl Resolver {
             adaptive_cache_high_miss_ratio,
             adaptive_cache_low_miss_ratio,
             enable_recursion,
+            dns64_enabled: AtomicBool::new(dns64_enabled),
+            dns64_prefix: RwLock::new(dns64_prefix),
             minimal_response: true,
+            qname_minimization,
             current_cache_capacity: AtomicUsize::new(current_cache_capacity),
             dnssec_enabled,
             dnssec_validation_cache: DnssecValidationCache::new(300),
@@ -822,6 +837,10 @@ impl Resolver {
     /// 配置是否启用最小应答。
     pub fn configure_minimal_response(&mut self, minimal_response: bool) {
         self.minimal_response = minimal_response;
+    }
+
+    pub fn configure_qname_minimization(&mut self, enabled: bool) {
+        self.qname_minimization = enabled;
     }
 
     /// 配置全局权威区记录（从 AppConfig.authoritative_zones 加载）。
@@ -980,6 +999,97 @@ impl Resolver {
         request: &[u8],
     ) -> anyhow::Result<ResolvedResponse> {
         self.resolve_with_view(ctx, request, None).await
+    }
+
+    pub fn set_dns64_settings(&self, enabled: bool, prefix: std::net::Ipv6Addr) {
+        self.dns64_enabled.store(enabled, Ordering::Relaxed);
+        if let Ok(mut guard) = self.dns64_prefix.write() {
+            *guard = prefix;
+        }
+    }
+
+    fn dns64_synthesize_aaaa_response(&self, request: &[u8], a_packet: &[u8]) -> Option<Vec<u8>> {
+        if !self.dns64_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let (qname, qtype, _) = dns::parse_first_question(request)?;
+        if qtype != 28 {
+            return None;
+        }
+
+        let overview = dns::parse_response_overview(a_packet)?;
+        if overview.rcode != 0 || overview.ancount == 0 {
+            return None;
+        }
+
+        let analysis = dns::analyze_answer_for_name_with_dnames(a_packet, &qname, 1)?;
+        if !analysis.analysis.has_target_record {
+            return None;
+        }
+
+        let ips = dns::extract_answer_ips(a_packet);
+        let ipv4 = ips
+            .into_iter()
+            .find_map(|ip| ip.parse::<std::net::Ipv4Addr>().ok())?;
+        let ipv4_octets = ipv4.octets();
+        let prefix = *self.dns64_prefix.read().ok()?;
+        let prefix = prefix.octets();
+        let mut ipv6_octets = prefix;
+        ipv6_octets[12..16].copy_from_slice(&ipv4_octets);
+
+        let ttl = dns::extract_cache_ttl(a_packet)
+            .map(|ttl| ttl.as_secs().min(u32::MAX as u64) as u32)
+            .unwrap_or(60);
+
+        crate::codec::dns::build_static_answer(
+            request,
+            &std::net::Ipv6Addr::from(ipv6_octets).to_string(),
+            ttl,
+            "AAAA",
+        )
+        .ok()
+    }
+
+    async fn dns64_fallback_for_aaaa_query(
+        &self,
+        ctx: &RequestContext,
+        request: &[u8],
+        allow_upstream_recursion: bool,
+    ) -> Option<Vec<u8>> {
+        if !self.dns64_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let (qname, qtype, _) = dns::parse_first_question(request)?;
+        if qtype != 28 {
+            return None;
+        }
+
+        if dns::answer_has_record_type_for_name(request, &qname, 28) {
+            return None;
+        }
+
+        let a_request = dns::build_query_like_request(request, dns::parse_header(request).ok()?.id, &qname, 1, true)?;
+        let a_ctx = RequestContext {
+            request_id: ctx.request_id,
+            protocol: ctx.protocol,
+            client_addr: ctx.client_addr,
+            query_name: Some(SmolStr::from(qname.as_str())),
+            query_type: Some(1),
+            recv_at: ctx.recv_at,
+        };
+
+        let a_response = Box::pin(self.resolve_uncached(
+            &a_ctx,
+            &a_request,
+            None,
+            allow_upstream_recursion,
+        ))
+        .await
+        .ok()?;
+
+        self.dns64_synthesize_aaaa_response(request, &a_response.packet)
     }
 
     pub async fn resolve_with_view(
@@ -1230,8 +1340,8 @@ impl Resolver {
             ),
             _ => None,
         };
-
         if let Some(cache_key) = &cache_key {
+            if self.cache.remaining_ttl(cache_key, false).is_some() {
             if let Some(result) = self.try_bad_cache_hit(ctx, request, cache_key) {
                 self.record_cache_window_hit();
                 self.maybe_tune_cache_capacity();
@@ -1295,6 +1405,19 @@ impl Resolver {
                         self.normalize_ra_for_recursion_policy(response, allow_upstream_recursion)
                     });
                 }
+            }
+            } else {
+                return self
+                    .resolve_uncached(
+                        ctx,
+                        request,
+                        Some(cache_key.clone()),
+                        allow_upstream_recursion,
+                    )
+                    .await
+                    .map(|response| {
+                        self.normalize_ra_for_recursion_policy(response, allow_upstream_recursion)
+                    });
             }
         }
 
@@ -2106,6 +2229,24 @@ impl Resolver {
         })
     }
 
+    fn try_stale_cache_hit(
+        &self,
+        ctx: &RequestContext,
+        request: &[u8],
+        cache_key: &CacheKey,
+    ) -> Option<ResolvedResponse> {
+        let cached = self.cache.get_stale(cache_key)?;
+        debug!(request_id = ctx.request_id, "stale cache hit");
+        let resp = finalize_response_for_client(request, &cached);
+        let resp = self.apply_ip_health_policy(ctx.query_name.as_deref(), &resp);
+        self.metrics
+            .record_cache_hit(dns::response_code(&resp).unwrap_or(2));
+        Some(ResolvedResponse {
+            packet: resp,
+            source: ResolutionSource::Cache,
+        })
+    }
+
     /// 未命中缓存时的实际解析逻辑。
     async fn resolve_uncached(
         &self,
@@ -2135,6 +2276,14 @@ impl Resolver {
                         .validate_and_finalize_response(request, &packet, None, cache_key.as_ref())
                         .await?;
                     let packet = self.apply_ip_health_policy(ctx.query_name.as_deref(), &packet);
+                    let packet = if let Some(dns64_packet) = self
+                        .dns64_fallback_for_aaaa_query(ctx, request, allow_upstream_recursion)
+                        .await
+                    {
+                        dns64_packet
+                    } else {
+                        packet
+                    };
                     if let Some(cache_key) = cache_key.clone() {
                         if let Some(ttl) = self.cache_ttl_if_cacheable(&packet) {
                             self.cache.insert(cache_key, packet.clone(), ttl);
@@ -2170,6 +2319,7 @@ impl Resolver {
         let mut upstream_plan = Vec::new();
         let mut response = None;
         let mut source = None;
+        let mut upstreams_exhausted = false;
 
         loop {
             state = match state {
@@ -2188,41 +2338,42 @@ impl Resolver {
                 }
                 ResolutionState::QueryUpstream(index) => {
                     if index >= upstream_plan.len() {
-                        return Err(anyhow!("all upstream resolvers failed"));
-                    }
-
-                    let upstream_index = upstream_plan[index];
-                    trace!(
-                        request_id = ctx.request_id,
-                        step = index,
-                        upstream = %self.upstreams[upstream_index].address,
-                        "querying upstream"
-                    );
-                    match self.query_single_upstream(upstream_index, request).await {
-                        Ok((packet, _rtt)) => {
-                            if index > 0 {
-                                self.forwarder_failovers.fetch_add(1, Ordering::Relaxed);
+                        upstreams_exhausted = true;
+                        ResolutionState::CacheStore
+                    } else {
+                        let upstream_index = upstream_plan[index];
+                        trace!(
+                            request_id = ctx.request_id,
+                            step = index,
+                            upstream = %self.upstreams[upstream_index].address,
+                            "querying upstream"
+                        );
+                        match self.query_single_upstream(upstream_index, request).await {
+                            Ok((packet, _rtt)) => {
+                                if index > 0 {
+                                    self.forwarder_failovers.fetch_add(1, Ordering::Relaxed);
+                                }
+                                source = Some(ResolutionSource::Upstream(
+                                    self.upstreams[upstream_index].address.clone(),
+                                ));
+                                response = Some(packet);
+                                ResolutionState::CacheStore
                             }
-                            source = Some(ResolutionSource::Upstream(
-                                self.upstreams[upstream_index].address.clone(),
-                            ));
-                            response = Some(packet);
-                            ResolutionState::CacheStore
-                        }
-                        Err(err) => {
-                            let err_msg = err.to_string();
-                            if err_msg.contains("cname chain loop detected")
-                                || err_msg.contains("cname chain exceeded max depth")
-                            {
-                                return Err(err);
+                            Err(err) => {
+                                let err_msg = err.to_string();
+                                if err_msg.contains("cname chain loop detected")
+                                    || err_msg.contains("cname chain exceeded max depth")
+                                {
+                                    return Err(err);
+                                }
+                                warn!(
+                                    upstream = %self.upstreams[upstream_index].address,
+                                    request_id = ctx.request_id,
+                                    "upstream query failed: {}",
+                                    err
+                                );
+                                ResolutionState::QueryUpstream(index + 1)
                             }
-                            warn!(
-                                upstream = %self.upstreams[upstream_index].address,
-                                request_id = ctx.request_id,
-                                "upstream query failed: {}",
-                                err
-                            );
-                            ResolutionState::QueryUpstream(index + 1)
                         }
                     }
                 }
@@ -2256,7 +2407,21 @@ impl Resolver {
                     });
                 }
             };
+
+            if upstreams_exhausted {
+                break;
+            }
         }
+
+        if upstreams_exhausted {
+            if let Some(cache_key) = cache_key.as_ref() {
+                if let Some(stale) = self.try_stale_cache_hit(ctx, request, cache_key) {
+                    return Ok(stale);
+                }
+            }
+        }
+
+        Err(anyhow!("all upstream resolvers failed"))
     }
 
     /// 判断响应是否可缓存，并返回应使用的缓存 TTL。
@@ -2483,7 +2648,7 @@ impl Resolver {
     async fn prefetch_once(&self, request: &[u8], qname: &str, qtype: u16) -> anyhow::Result<()> {
         let cache_key = cache_key_for_query(qname, qtype, dns::dnssec_ok_requested(request));
         let upstream_result = if self.mode == ResolverMode::Iterative {
-            self.query_iterative_single(request, None)
+            self.query_iterative_single(request, None, false)
                 .await
                 .map(|(packet, _)| (packet, None))
         } else {
@@ -2870,7 +3035,7 @@ impl Resolver {
         })?;
 
         if self.mode == ResolverMode::Iterative {
-            let (packet, _) = self.query_iterative_single(&query, None).await?;
+            let (packet, _) = self.query_iterative_single(&query, None, false).await?;
             return Ok(packet);
         }
 
@@ -3327,8 +3492,14 @@ impl Resolver {
                 trace!(upstream = %upstream_addr, rcode, qtype, "cname chain resolved or terminal response reached");
                 let merged = dns::append_cname_answers(&current_packet, &collected_cnames)
                     .unwrap_or_else(|| current_packet.clone());
-                let merged =
+                let mut merged =
                     dns::append_answer_records(&merged, &collected_dnames).unwrap_or(merged);
+                // When the final CNAME target returned an error but we have collected
+                // CNAME records, clear the header RCODE to NOERROR — the original query
+                // name HAS a CNAME, the error is only about the target.
+                if rcode != 0 && !collected_cnames.is_empty() {
+                    dns::clear_header_rcode(&mut merged);
+                }
                 // Wrap collected vectors in Arc to share with Phase C background task
                 // without cloning the full vectors (atomic refcount instead of O(n) allocation).
                 let collected_cnames = Arc::new(collected_cnames);
@@ -3442,10 +3613,14 @@ impl Resolver {
 
             let Some(next_name) = analysis.and_then(|value| value.first_cname.clone()) else {
                 trace!(upstream = %upstream_addr, "no cname answer found, returning current response");
-                // Cache the collected CNAME chain (even without final answer)
+                // Append collected CNAMEs to the response so the client sees the
+                // CNAME chain even when the final hop returned no target record.
+                let merged = dns::append_cname_answers(&current_packet, &collected_cnames)
+                    .unwrap_or_else(|| current_packet.clone());
+                let merged = dns::append_answer_records(&merged, &collected_dnames)
+                    .unwrap_or(merged);
+                // Cache the combined CNAME chain (even without final answer)
                 if self.cname_chain_cache_enabled && !collected_cnames.is_empty() {
-                    let merged = dns::append_cname_answers(&current_packet, &collected_cnames)
-                        .unwrap_or_else(|| current_packet.clone());
                     if let Some(final_packet) = dns::rewrite_question_from_request(&merged, request) {
                         let cache_key =
                             cache_key_for_query(&qname, qtype, dns::dnssec_ok_requested(request));
@@ -3454,7 +3629,7 @@ impl Resolver {
                         }
                     }
                 }
-                return Ok(current_packet);
+                return Ok(merged);
             };
 
             if cname_depth >= self.cname_chain_max_depth {
@@ -3519,11 +3694,11 @@ impl Resolver {
     async fn query_iterative(&self, request: &[u8]) -> anyhow::Result<(Vec<u8>, String)> {
         if !self.follow_cname_chain {
             trace!("cname follow disabled for iterative mode");
-            return self.query_iterative_single(request, None).await;
+            return self.query_iterative_single(request, None, false).await;
         }
 
         let Some((qname, qtype, _)) = dns::parse_first_question(request) else {
-            return self.query_iterative_single(request, None).await;
+            return self.query_iterative_single(request, None, false).await;
         };
         if qtype != 1 && qtype != 28 {
             if qtype == 5 && self.iterative_fallback_to_forwarder {
@@ -3534,7 +3709,7 @@ impl Resolver {
                 }
             }
             trace!(qtype, "iterative cname follow skipped for non A/AAAA query");
-            return self.query_iterative_single(request, None).await;
+            return self.query_iterative_single(request, None, false).await;
         }
         let global_deadline = Instant::now() + self.iterative_timeout;
         let query_id = dns::parse_header(request)
@@ -3593,14 +3768,14 @@ impl Resolver {
                 } else {
                     timeout(
                         remaining_budget,
-                        self.query_iterative_single(&query_buf, Some(global_deadline)),
+                        self.query_iterative_single(&query_buf, Some(global_deadline), true),
                     )
                     .await
                 }
             } else {
                 timeout(
                     remaining_budget,
-                    self.query_iterative_single(&query_buf, Some(global_deadline)),
+                    self.query_iterative_single(&query_buf, Some(global_deadline), true),
                 )
                 .await
             };
@@ -3672,8 +3847,16 @@ impl Resolver {
                 trace!(resolver = %resolver_addr, rcode, qtype, "iterative cname chain resolved or terminal response reached");
                 let merged = dns::append_cname_answers(&packet, &collected_cnames)
                     .unwrap_or_else(|| packet.clone());
-                let merged =
+                let mut merged =
                     dns::append_answer_records(&merged, &collected_dnames).unwrap_or(merged);
+                // When the final CNAME target returned an error (NXDOMAIN etc.) but
+                // we have collected CNAME records, clear the header RCODE to NOERROR.
+                // The original query name HAS a CNAME record — the error is only about
+                // the target, and propagating it would mislead clients into thinking
+                // the original query name does not exist.
+                if rcode != 0 && !collected_cnames.is_empty() {
+                    dns::clear_header_rcode(&mut merged);
+                }
                 // Cache combined CNAME chain result under original query name
                 if self.cname_chain_cache_enabled {
                     if let Some(final_packet) =
@@ -3703,10 +3886,14 @@ impl Resolver {
 
             let Some(next_name) = analysis.and_then(|value| value.first_cname.clone()) else {
                 trace!(resolver = %resolver_addr, "iterative response has no cname answer, returning current response");
-                // Cache the collected CNAME chain (even without final answer)
+                // Append collected CNAMEs to the response so the client sees the
+                // CNAME chain even when the final hop returned no target record.
+                let merged = dns::append_cname_answers(&packet, &collected_cnames)
+                    .unwrap_or_else(|| packet.clone());
+                let merged = dns::append_answer_records(&merged, &collected_dnames)
+                    .unwrap_or(merged);
+                // Cache the combined CNAME chain (even without final answer)
                 if self.cname_chain_cache_enabled && !collected_cnames.is_empty() {
-                    let merged = dns::append_cname_answers(&packet, &collected_cnames)
-                        .unwrap_or_else(|| packet.clone());
                     if let Some(final_packet) =
                         dns::rewrite_question_from_request(&merged, &orig_request)
                     {
@@ -3720,7 +3907,7 @@ impl Resolver {
                         }
                     }
                 }
-                return Ok((packet, resolver_addr));
+                return Ok((merged, resolver_addr));
             };
 
             if cname_depth >= self.cname_chain_max_depth {
@@ -3780,6 +3967,7 @@ impl Resolver {
         &self,
         request: &[u8],
         budget_deadline: Option<Instant>,
+        disable_qname_minimization: bool,
     ) -> anyhow::Result<(Vec<u8>, String)> {
         // Iterative mode walks referral candidates with depth and time budgets.
         let iterative_started = Instant::now();
@@ -3806,13 +3994,17 @@ impl Resolver {
 
         let iterative_request =
             dns::set_recursion_desired(request, false).unwrap_or_else(|| request.to_vec());
-        let query_name = dns::parse_first_question(&iterative_request)
+        let original_query_name = dns::parse_first_question(&iterative_request)
             .map(|(name, _, _)| name)
             .unwrap_or_else(|| ".".to_string());
-        let selective_trace = crate::logging::should_trace_query_name(&query_name);
+        let original_qtype = dns::parse_first_question(&iterative_request)
+            .map(|(_, qtype, _)| qtype)
+            .unwrap_or(1);
+        let selective_trace = crate::logging::should_trace_query_name(&original_query_name);
 
         let (mut candidates, mut delegation_seed_zone) =
-            if let Some((zone, endpoints)) = self.get_cached_delegation_endpoints(&query_name) {
+            if let Some((zone, endpoints)) = self.get_cached_delegation_endpoints(&original_query_name)
+            {
                 self.metrics.record_iterative_event("delegation_cache_hit");
                 (endpoints, Some(zone))
             } else {
@@ -3823,7 +4015,7 @@ impl Resolver {
             if selective_trace {
                 info!(
                     target: "query",
-                    qname = %query_name,
+                    qname = %original_query_name,
                     depth,
                     max_depth = self.iterative_max_depth,
                     candidate_count = candidates.len(),
@@ -3869,6 +4061,11 @@ impl Resolver {
             }
             let mut next_candidates = Vec::new();
             let mut last_error = None;
+            let effective_qname = if self.qname_minimization && !disable_qname_minimization {
+                util::iterative_minimized_qname(&original_query_name, usize::from(depth))
+            } else {
+                original_query_name.clone()
+            };
 
             let mut in_flight = FuturesUnordered::new();
             for server in candidates.clone() {
@@ -3876,7 +4073,7 @@ impl Resolver {
                 if selective_trace {
                     info!(
                         target: "query",
-                        qname = %query_name,
+                        qname = %effective_qname,
                         depth,
                         resolver = %server,
                         "selective iterative trace: querying candidate resolver"
@@ -3885,7 +4082,19 @@ impl Resolver {
                     trace!(depth, resolver = %server, "iterative querying candidate resolver");
                 }
                 in_flight.push(async {
-                    let result = self.query_address(&server, &iterative_request).await;
+                    let iterative_query = if self.qname_minimization {
+                        dns::build_query_like_request(
+                            &iterative_request,
+                            dns::parse_header(&iterative_request).map(|header| header.id).unwrap_or(0),
+                            &effective_qname,
+                            original_qtype,
+                            false,
+                        )
+                        .unwrap_or_else(|| iterative_request.clone())
+                    } else {
+                        iterative_request.clone()
+                    };
+                    let result = self.query_address(&server, &iterative_query).await;
                     (server, result)
                 });
             }
@@ -3899,7 +4108,7 @@ impl Resolver {
                         if selective_trace {
                             info!(
                                 target: "query",
-                                qname = %query_name,
+                                qname = %original_query_name,
                                 depth,
                                 resolver = %server,
                                 rcode,
@@ -3928,7 +4137,7 @@ impl Resolver {
                         // Validate referral security before using or caching it
                         let referral_validation = referral
                             .as_ref()
-                            .map(|analysis| dns::validate_referral_security(&query_name, analysis));
+                            .map(|analysis| dns::validate_referral_security(&original_query_name, analysis));
                         let referral_is_security_valid = referral_validation
                             .as_ref()
                             .map(|v| v.is_valid)
@@ -4061,7 +4270,7 @@ impl Resolver {
                                 if should_cache {
                                     if let Some(referral) = referral_for_cache.as_ref() {
                                         if let Some(zone) = self
-                                            .select_referral_zone_for_query(&query_name, referral)
+                                            .select_referral_zone_for_query(&original_query_name, referral)
                                         {
                                             let ttl = dns::extract_cache_ttl(&packet)
                                                 .unwrap_or(self.cache_ttl)
@@ -4132,7 +4341,7 @@ impl Resolver {
                 self.iterative_no_referral_glue_failures
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    qname = %query_name,
+                    qname = %original_query_name,
                     depth,
                     max_depth = self.iterative_max_depth,
                     selective_trace,
@@ -5981,6 +6190,37 @@ mod tests {
         packet
     }
 
+    fn build_ns_referral_response(request: &[u8], zone: &str, ns_host: &str, addr: [u8; 4]) -> Vec<u8> {
+        let header = dns::parse_header(request).expect("header");
+        let (_, _, qend) = dns::parse_first_question(request).expect("question");
+        let mut packet = Vec::with_capacity(128);
+        packet.extend_from_slice(&header.id.to_be_bytes());
+        let opcode = header.flags & 0x7800;
+        let rd = header.flags & 0x0100;
+        let flags = 0x8000 | opcode | rd | 0x0080;
+        packet.extend_from_slice(&flags.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&request[12..qend]);
+
+        append_name(&mut packet, zone);
+        packet.extend_from_slice(&2u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&300u32.to_be_bytes());
+        packet.extend_from_slice(&2u16.to_be_bytes());
+        append_name(&mut packet, ns_host);
+
+        append_name(&mut packet, ns_host);
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&300u32.to_be_bytes());
+        packet.extend_from_slice(&4u16.to_be_bytes());
+        packet.extend_from_slice(&addr);
+        packet
+    }
+
     fn build_answer_with_cname_and_dname_response(request: &[u8]) -> Vec<u8> {
         let header = dns::parse_header(request).expect("header");
         let (_, _, qend) = dns::parse_first_question(request).expect("question");
@@ -6202,6 +6442,9 @@ mod tests {
                 adaptive_cache_window_secs: 5,
                 adaptive_cache_high_miss_ratio: 0.6,
                 adaptive_cache_low_miss_ratio: 0.2,
+                qname_minimization: true,
+                dns64_enabled: false,
+                dns64_prefix: std::net::Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0),
                 enable_recursion: true,
                 dnssec_enabled: true,
                 trust_anchors: TrustAnchors::default(),
@@ -6291,6 +6534,9 @@ mod tests {
                 adaptive_cache_window_secs: 5,
                 adaptive_cache_high_miss_ratio: 0.6,
                 adaptive_cache_low_miss_ratio: 0.2,
+                qname_minimization: true,
+                dns64_enabled: false,
+                dns64_prefix: std::net::Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0),
                 enable_recursion: true,
                 dnssec_enabled: true,
                 trust_anchors: TrustAnchors::default(),
@@ -6402,6 +6648,36 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
         upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn iterative_qname_minimization_reduces_upstream_question_name() -> anyhow::Result<()> {
+        let seen_qnames = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_qnames_clone = seen_qnames.clone();
+        let (root_addr, root_handle) =
+            spawn_mock_upstream_with(Arc::new(AtomicUsize::new(0)), move |request| {
+                let (qname, _, _) = dns::parse_first_question(request).expect("question");
+                seen_qnames_clone
+                    .lock()
+                    .expect("lock")
+                    .push(qname.clone());
+                build_ns_referral_response(request, "example.com", "ns1.example.com", [127, 0, 0, 1])
+            })
+            .await?;
+
+        let mut resolver = make_iterative_resolver(vec![root_addr.to_string()], Vec::new());
+        resolver.configure_qname_minimization(true);
+        resolver.follow_cname_chain = false;
+
+        let request = dns::build_query(1001, "www.example.com", 1, true).expect("query");
+        let _ = resolver.query_iterative_single(&request, None, false).await;
+
+        let seen = seen_qnames.lock().expect("lock");
+        assert!(!seen.is_empty(), "root should receive at least one query");
+        assert_eq!(seen[0], "com");
+
+        root_handle.abort();
+        Ok(())
     }
 
     #[tokio::test]
@@ -6536,7 +6812,7 @@ mod tests {
         );
 
         let request = dns::build_query(901, "www.example.com", 1, true).expect("query");
-        let result = resolver.query_iterative_single(&request, None).await;
+        let result = resolver.query_iterative_single(&request, None, true).await;
 
         assert!(result.is_err());
         // Only the original query should be sent; invalid referral must not trigger
@@ -7556,7 +7832,7 @@ mod tests {
             make_iterative_resolver(vec![root_addr.to_string()], vec!["127.0.0.1:9".to_string()]);
 
         let request = dns::build_query(900, "servfail.example", 1, true).expect("query");
-        let (packet, resolver_addr) = resolver.query_iterative_single(&request, None).await?;
+        let (packet, resolver_addr) = resolver.query_iterative_single(&request, None, false).await?;
 
         assert_eq!(resolver_addr, root_addr.to_string());
         assert_eq!(dns::response_code(&packet), Some(2));
@@ -7583,7 +7859,7 @@ mod tests {
             make_iterative_resolver(vec![root_addr.to_string()], vec!["127.0.0.1:9".to_string()]);
 
         let request = dns::build_query(903, "refused.example", 1, true).expect("query");
-        let (packet, resolver_addr) = resolver.query_iterative_single(&request, None).await?;
+        let (packet, resolver_addr) = resolver.query_iterative_single(&request, None, false).await?;
 
         assert_eq!(resolver_addr, root_addr.to_string());
         assert_eq!(dns::response_code(&packet), Some(5));
@@ -7606,7 +7882,7 @@ mod tests {
             make_iterative_resolver(vec![root_addr.to_string()], vec!["127.0.0.1:9".to_string()]);
 
         let request = dns::build_query(904, "notimp.example", 1, true).expect("query");
-        let (packet, resolver_addr) = resolver.query_iterative_single(&request, None).await?;
+        let (packet, resolver_addr) = resolver.query_iterative_single(&request, None, false).await?;
 
         assert_eq!(resolver_addr, root_addr.to_string());
         assert_eq!(dns::response_code(&packet), Some(4));
@@ -7640,7 +7916,7 @@ mod tests {
 
         let request = dns::build_query(901, "budget.example", 1, true).expect("query");
         let err = resolver
-            .query_iterative_single(&request, None)
+            .query_iterative_single(&request, None, false)
             .await
             .expect_err("expected iterative timeout budget error");
 
@@ -7666,7 +7942,7 @@ mod tests {
             make_iterative_resolver(vec![root_addr.to_string()], vec!["127.0.0.1:9".to_string()]);
 
         let request = dns::build_query(902, "missing.example.com", 1, true).expect("query");
-        let (packet, resolver_addr) = resolver.query_iterative_single(&request, None).await?;
+        let (packet, resolver_addr) = resolver.query_iterative_single(&request, None, false).await?;
 
         assert_eq!(resolver_addr, root_addr.to_string());
         assert_eq!(dns::response_code(&packet), Some(0));
@@ -8551,6 +8827,30 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn stale_cache_is_used_when_upstream_is_unavailable() -> anyhow::Result<()> {
+        let mut resolver = make_resolver(vec!["127.0.0.1:9".to_string()], Vec::new(), Vec::new());
+        resolver.dnssec_enabled = false;
+        resolver.upstream_timeout = Duration::from_millis(100);
+        resolver.upstream_retries = 0;
+
+        let request = dns::build_query(920, "stale.example", 1, true).expect("query");
+        let ctx = make_request_context(920, "stale.example", 1);
+        let cache_key = cache_key_for_query("stale.example", 1, false);
+
+        resolver.cache.insert(
+            cache_key.clone(),
+            build_answer_a_response(&request, [192, 0, 2, 123]),
+            Duration::from_secs(1),
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let response = resolver.resolve(&ctx, &request).await?;
+        assert_eq!(dns::response_code(&response.packet), Some(0));
+        assert!(dns::answer_has_record_type(&response.packet, 1));
+        Ok(())
+    }
+
     // ── Live DNS Resolution Benchmarks ─────────────────────────────────
     // These tests require internet access and use real DNS infrastructure.
     // Run with: cargo test -- cname_live --ignored --nocapture
@@ -8611,6 +8911,9 @@ mod tests {
                 adaptive_cache_window_secs: 5,
                 adaptive_cache_high_miss_ratio: 0.6,
                 adaptive_cache_low_miss_ratio: 0.2,
+                qname_minimization: true,
+                dns64_enabled: false,
+                dns64_prefix: std::net::Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0),
                 enable_recursion: true,
                 dnssec_enabled: false,
                 trust_anchors: TrustAnchors::default(),
@@ -8665,6 +8968,9 @@ mod tests {
                 static_cname_expand_for_address_queries: false,
                 iterative_fallback_to_forwarder: true,
                 iterative_cname_bridge_fallback_to_recursive: true,
+                qname_minimization: true,
+                dns64_enabled: false,
+                dns64_prefix: std::net::Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0),
                 cname_chain_cache_enabled: true,
                 cname_chain_inline_cache_enabled: true,
                 cname_chain_dualstack_share_enabled: true,

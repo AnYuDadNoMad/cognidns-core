@@ -282,6 +282,15 @@ impl ResponseCache {
         Some(packet)
     }
 
+    /// Reads an entry even if it has expired, without removing it.
+    /// 获取过期缓存条目，供 serve-stale 回退使用。
+    pub fn get_stale(&self, key: &CacheKey) -> Option<Vec<u8>> {
+        let shard = self.shard_for_key(key);
+        let entries = shard.entries.read().ok()?;
+        let entry = entries.get(key)?;
+        Some(unwrap_or_clone_vec(Arc::clone(&entry.response)))
+    }
+
     /// Returns remaining ttl for a key when present and not expired.
     pub fn remaining_ttl(&self, key: &CacheKey, freeze_ttl: bool) -> Option<Duration> {
         let now = Instant::now();
@@ -463,6 +472,10 @@ impl ResponseCache {
 impl crate::traits::DnsCache for ResponseCache {
     fn get(&self, key: &CacheKey, freeze_ttl: bool) -> Option<Vec<u8>> {
         self.get(key, freeze_ttl)
+    }
+
+    fn get_stale(&self, key: &CacheKey) -> Option<Vec<u8>> {
+        self.get_stale(key)
     }
 
     fn remaining_ttl(&self, key: &CacheKey, freeze_ttl: bool) -> Option<Duration> {
@@ -785,5 +798,114 @@ mod tests {
             .expect("visualization must exist");
         assert_eq!(viz.id, 0x1234);
         assert_eq!(viz.rcode, 0);
+    }
+
+    #[test]
+    fn get_stale_returns_expired_response_after_ttl_expires() {
+        let cache = ResponseCache::new(4);
+        let key = CacheKey {
+            qname: "stale.example".into(),
+            qtype: 1,
+            dnssec_ok: false,
+        };
+        let response = vec![0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        cache.insert(key.clone(), response.clone(), Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(cache.get_stale(&key), Some(response));
+        assert!(cache.get(&key, false).is_none());
+    }
+
+    #[test]
+    fn prune_expired_removes_only_after_expiry() {
+        let cache = ResponseCache::new(4);
+        let key = CacheKey {
+            qname: "prune.example".into(),
+            qtype: 1,
+            dnssec_ok: false,
+        };
+
+        cache.insert(key.clone(), vec![1, 2, 3, 4], Duration::from_millis(10));
+        cache.prune_expired(&key);
+        assert!(cache.get(&key, false).is_some());
+
+        std::thread::sleep(Duration::from_millis(20));
+        cache.prune_expired(&key);
+        assert!(cache.get_stale(&key).is_none());
+    }
+
+    #[test]
+    fn clear_domain_removes_subdomains_but_not_unrelated_entries() {
+        let cache = ResponseCache::new(8);
+        let ttl = Duration::from_secs(60);
+
+        cache.insert(
+            CacheKey {
+                qname: "example.com".into(),
+                qtype: 1,
+                dnssec_ok: false,
+            },
+            vec![1],
+            ttl,
+        );
+        cache.insert(
+            CacheKey {
+                qname: "api.example.com".into(),
+                qtype: 1,
+                dnssec_ok: false,
+            },
+            vec![2],
+            ttl,
+        );
+        cache.insert(
+            CacheKey {
+                qname: "other.example.net".into(),
+                qtype: 1,
+                dnssec_ok: false,
+            },
+            vec![3],
+            ttl,
+        );
+
+        let removed = cache.clear_domain("example.com");
+
+        assert_eq!(removed, 2);
+        assert!(
+            cache
+                .get(
+                    &CacheKey {
+                        qname: "example.com".into(),
+                        qtype: 1,
+                        dnssec_ok: false,
+                    },
+                    false,
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(
+                    &CacheKey {
+                        qname: "api.example.com".into(),
+                        qtype: 1,
+                        dnssec_ok: false,
+                    },
+                    false,
+                )
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(
+                    &CacheKey {
+                        qname: "other.example.net".into(),
+                        qtype: 1,
+                        dnssec_ok: false,
+                    },
+                    false,
+                )
+                .is_some()
+        );
     }
 }

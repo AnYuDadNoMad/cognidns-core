@@ -397,6 +397,12 @@ pub struct AppConfig {
     pub blocked_domains: Vec<String>,
     /// 全局递归开关：false 时仅响应本地权威/静态数据，不向上游递归查询。
     pub enable_recursion: bool,
+    /// 是否在递归迭代查询中启用 QNAME minimization。
+    pub qname_minimization: bool,
+    /// 启用 DNS64：当递归 AAAA 查询没有 AAAA 但存在 A 记录时，合成 AAAA 返回。
+    pub dns64_enabled: bool,
+    /// DNS64 合成前缀，默认 64:ff9b::/96。
+    pub dns64_prefix: Ipv6Addr,
     /// 是否启用最小应答（minimal response）。
     /// true: 仅返回最小必要区段；false: 可附加 MX/NS 目标主机 A/AAAA。
     pub minimal_response: bool,
@@ -497,6 +503,9 @@ impl Default for AppConfig {
             blocked_domains_file: None,
             blocked_domains: Vec::new(),
             enable_recursion: true,
+            qname_minimization: true,
+            dns64_enabled: false,
+            dns64_prefix: Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0),
             minimal_response: true,
             views: Vec::new(),
             rate_limit_per_second: 0,
@@ -833,6 +842,14 @@ impl AppConfig {
             &mut self.blocked_domains_file,
             "blocked_domains_file",
         )?;
+        load_misplaced_field_if_absent(
+            &document,
+            root,
+            &mut self.qname_minimization,
+            "qname_minimization",
+        )?;
+        load_misplaced_field_if_absent(&document, root, &mut self.dns64_enabled, "dns64_enabled")?;
+        load_misplaced_field_if_absent(&document, root, &mut self.dns64_prefix, "dns64_prefix")?;
         load_misplaced_field_if_absent(&document, root, &mut self.views, "views")?;
         load_misplaced_field_if_absent(
             &document,

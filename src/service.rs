@@ -379,6 +379,9 @@ impl AppState {
                     adaptive_cache_high_miss_ratio: cfg.adaptive_cache_high_miss_ratio,
                     adaptive_cache_low_miss_ratio: cfg.adaptive_cache_low_miss_ratio,
                     enable_recursion: cfg.enable_recursion,
+                    qname_minimization: cfg.qname_minimization,
+                    dns64_enabled: cfg.dns64_enabled,
+                    dns64_prefix: cfg.dns64_prefix,
                     dnssec_enabled: cfg.dnssec.enabled,
                     trust_anchors: dnssec::load_trust_anchors(
                         &self.config_path,

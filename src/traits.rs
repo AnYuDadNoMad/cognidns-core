@@ -32,6 +32,9 @@ pub trait DnsCache: Send + Sync + fmt::Debug {
     /// When `freeze_ttl` is true, the expiry check is skipped.
     fn get(&self, key: &CacheKey, freeze_ttl: bool) -> Option<Vec<u8>>;
 
+    /// Look up a cached response even if it has expired.
+    fn get_stale(&self, key: &CacheKey) -> Option<Vec<u8>>;
+
     /// Return the remaining TTL for a cached key, if present and not expired.
     fn remaining_ttl(&self, key: &CacheKey, freeze_ttl: bool) -> Option<Duration>;
 
@@ -130,6 +133,10 @@ mod tests {
 
     impl DnsCache for MockCache {
         fn get(&self, key: &CacheKey, _freeze_ttl: bool) -> Option<Vec<u8>> {
+            self.entries.lock().unwrap().get(key).cloned()
+        }
+
+        fn get_stale(&self, key: &CacheKey) -> Option<Vec<u8>> {
             self.entries.lock().unwrap().get(key).cloned()
         }
 

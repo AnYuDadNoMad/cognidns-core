@@ -1465,6 +1465,42 @@ pub fn udp_payload_size_for_request(packet: &[u8]) -> usize {
         .unwrap_or(4096)
 }
 
+pub fn truncate_response_for_udp(request: &[u8], response: &[u8]) -> Option<Vec<u8>> {
+    let limit = udp_payload_size_for_request(request).max(512).min(u16::MAX as usize);
+    if response.len() <= limit {
+        return Some(response.to_vec());
+    }
+
+    let header = parse_header(response).ok()?;
+    let (_, _, qend) = parse_first_question(response)?;
+
+    let mut truncated = Vec::with_capacity(qend + 16);
+    truncated.extend_from_slice(&response[..qend]);
+
+    let mut flags = u16::from_be_bytes([truncated[2], truncated[3]]);
+    flags |= 0x0200; // TC
+    truncated[2..4].copy_from_slice(&flags.to_be_bytes());
+
+    if header.qdcount > 0 {
+        truncated[4..6].copy_from_slice(&header.qdcount.to_be_bytes());
+    } else {
+        truncated[4..6].copy_from_slice(&1u16.to_be_bytes());
+    }
+    truncated[6..8].copy_from_slice(&0u16.to_be_bytes());
+    truncated[8..10].copy_from_slice(&0u16.to_be_bytes());
+    truncated[10..12].copy_from_slice(&0u16.to_be_bytes());
+
+    if let Some(opt) = extract_opt_record_bytes(request) {
+        let projected = truncated.len().saturating_add(opt.len());
+        if projected <= limit {
+            truncated.extend_from_slice(&opt);
+            truncated[10..12].copy_from_slice(&1u16.to_be_bytes());
+        }
+    }
+
+    Some(truncated)
+}
+
 fn maybe_append_request_edns_opt(request: &[u8], response: &mut Vec<u8>) -> Option<()> {
     maybe_append_request_edns_opt_with_rcode(request, response, 0)
 }
@@ -2416,6 +2452,16 @@ pub fn response_code(packet: &[u8]) -> Option<u16> {
     Some(parse_response_overview(packet)?.rcode)
 }
 
+/// Clears the RCODE field in the DNS header (low nibble of byte 3) to NOERROR(0).
+/// Used when a CNAME chain has collected valid CNAME records but the final
+/// target returned an error (e.g. NXDOMAIN) — the original query name DOES have
+/// a CNAME, so the rcode should reflect that.
+pub fn clear_header_rcode(packet: &mut [u8]) {
+    if packet.len() >= 4 {
+        packet[3] &= 0xF0;
+    }
+}
+
 pub fn decay_response_ttl_in_place(packet: &mut [u8], elapsed: Duration) {
     let Ok(header) = parse_header(packet) else {
         return;
@@ -2523,6 +2569,23 @@ mod tests {
             ],
         )
         .expect("append edns options");
+        packet
+    }
+
+    fn edns_query_with_cookie(cookie: &[u8]) -> Vec<u8> {
+        let mut packet = basic_query();
+        append_edns_opt_with_options(
+            &mut packet,
+            1232,
+            0,
+            0,
+            DNS_EDNS_FLAG_DO,
+            &[DnsEdnsOption {
+                code: DNS_EDNS_OPTION_COOKIE,
+                data: cookie.to_vec(),
+            }],
+        )
+        .expect("append cookie edns");
         packet
     }
 
@@ -2982,6 +3045,20 @@ mod tests {
         assert!(edns.options.is_empty());
     }
 
+    #[test]
+    fn truncate_response_for_udp_sets_tc_and_respects_payload_size() {
+        let request = edns_query();
+        let mut response = build_response_with_rcode(&request, 0).expect("response");
+        response.extend_from_slice(&vec![0u8; 2048]);
+
+        let truncated = truncate_response_for_udp(&request, &response).expect("truncated");
+        let header = parse_header(&truncated).expect("header");
+
+        assert!(truncated.len() <= udp_payload_size_for_request(&request));
+        assert!(header.flags & 0x0200 != 0);
+        assert_eq!(header.qdcount, 1);
+    }
+
     fn push_name_rr(
         packet: &mut Vec<u8>,
         owner: &str,
@@ -3073,6 +3150,18 @@ mod tests {
     }
 
     #[test]
+    fn extracts_cookie_option_and_rejects_short_cookie() {
+        let packet = edns_query_with_cookie(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(
+            extract_edns_cookie(&packet),
+            Some((vec![1, 2, 3, 4, 5, 6, 7, 8], Some(vec![9, 10, 11, 12])))
+        );
+
+        let short_cookie = edns_query_with_cookie(&[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(extract_edns_cookie(&short_cookie), None);
+    }
+
+    #[test]
     fn align_response_edns_to_request_strips_unsolicited_opt() {
         let request = basic_query();
         let response = build_response_with_rcode(&edns_query_with_options(DNS_EDNS_FLAG_DO), 0)
@@ -3092,6 +3181,19 @@ mod tests {
         assert_eq!(edns.udp_payload_size, 1232);
         assert_eq!(edns.flags & DNS_EDNS_FLAG_DO, DNS_EDNS_FLAG_DO);
         assert_eq!(edns.options.len(), 0);
+    }
+
+    #[test]
+    fn build_query_like_request_preserves_cookie_option() {
+        let request = edns_query_with_cookie(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        let query = build_query_like_request(&request, 77, "alias.example.com", 1, true)
+            .expect("query");
+
+        assert_eq!(extract_edns_cookie(&query), Some((
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            Some(vec![9, 10, 11, 12])
+        )));
+        assert!(dnssec_ok_requested(&query));
     }
 
     #[test]
